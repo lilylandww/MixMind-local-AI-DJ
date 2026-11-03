@@ -51,6 +51,12 @@ services:
         condition: service_healthy
     volumes:
       - ./cache:/app/cache
+      # Server-side folder import (POST /api/imports/folder): expose the
+      # host's music collection read-only inside the backend. Point
+      # MUSIC_HOST_DIR at your music directory (and set IMPORT_ROOT=/music
+      # in backend/.env) to enable; unset, this binds an empty subdir of
+      # the gitignored cache and the import root stays disabled.
+      - ${MUSIC_HOST_DIR:-./cache/music}:/music:ro
 
   frontend:
     build:

@@ -256,3 +256,82 @@ def test_imported_audio_streams_with_range(
     )
     assert partial.status_code == 206
     assert len(partial.content) == 100
+
+
+# --- folder import (POST /api/imports/folder) --------------------------------
+
+
+def test_folder_import_400_when_import_root_unset(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+):
+    # Path("") survives as Path(".") after pydantic validation — the
+    # endpoint's guard must treat both as "unset".
+    monkeypatch.setattr(settings, "import_root", Path(""))
+    client = _client(db_session)
+    r = client.post("/api/imports/folder", json={"path": ""})
+    assert r.status_code == 400
+    assert "IMPORT_ROOT not configured" in r.json()["detail"]
+
+
+def test_folder_import_rejects_path_traversal(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(settings, "import_root", tmp_path)
+    client = _client(db_session)
+    r = client.post("/api/imports/folder", json={"path": "../etc"})
+    assert r.status_code == 400
+    assert "escapes IMPORT_ROOT" in r.json()["detail"]
+
+
+def test_folder_import_404_on_missing_dir(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(settings, "import_root", tmp_path)
+    client = _client(db_session)
+    r = client.post("/api/imports/folder", json={"path": "nope"})
+    assert r.status_code == 404
+
+
+@needs_ffmpeg
+def test_folder_import_imports_audio_skips_txt(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(settings, "import_root", tmp_path)
+    music = tmp_path / "music"
+    music.mkdir()
+    sf.write(music / "a.wav", [0.0] * 22050, 22050)
+    sf.write(music / "01 - Artist B - Song B.wav", [0.0] * 11025, 22050)
+    (music / "notes.txt").write_text("not audio")
+
+    client = _client(db_session)
+    r = client.post("/api/imports/folder", json={"path": "music"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body) == 2
+    titles = {s["title"] for s in body}
+    assert titles == {"a", "Song B"}
+    artists = {s["artist"] for s in body}
+    assert artists == {None, "Artist B"}
+    assert all(s["youtube_video_id"].startswith("local-") for s in body)
+    assert all(s["status"] == "downloaded" for s in body)
+
+
+@needs_ffmpeg
+def test_folder_import_dedupes_on_rerun(
+    db_session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(settings, "import_root", tmp_path)
+    music = tmp_path / "music"
+    music.mkdir()
+    sf.write(music / "a.wav", [0.0] * 22050, 22050)
+    sf.write(music / "b.wav", [0.0] * 11025, 22050)
+
+    client = _client(db_session)
+    r1 = client.post("/api/imports/folder", json={"path": "music"})
+    assert r1.status_code == 200, r1.text
+    r2 = client.post("/api/imports/folder", json={"path": "music"})
+    assert r2.status_code == 200, r2.text
+    ids1 = [s["id"] for s in r1.json()]
+    ids2 = [s["id"] for s in r2.json()]
+    assert sorted(ids1) == sorted(ids2)
+    assert len(ids1) == 2

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -18,6 +19,7 @@ from app.schemas import SongRead
 from app.services.imports import (
     AUDIO_EXTENSIONS,
     NormalizeError,
+    content_digest,
     guess_metadata,
     normalize_to_wav,
     probe_duration,
@@ -173,3 +175,49 @@ async def import_audio(
     sr.has_stems = False
     sr.has_transcription = False
     return sr
+
+
+class FolderImportRequest(BaseModel):
+    path: str                      # relative to settings.import_root
+    recurse: bool = True
+    process_now: bool = False
+
+
+@router.post("/folder", response_model=list[SongRead])
+async def import_folder(
+    payload: FolderImportRequest, db: Session = Depends(get_db)
+) -> list[SongRead]:
+    """Import every decodable audio file under a directory on the server.
+
+    Only enabled when settings.import_root is configured (bind-mount your
+    music folder into the backend container). `payload.path` is resolved
+    relative to that root and may not escape it. Files already in the
+    library (same content hash) come back unchanged instead of re-adding.
+    """
+    root = settings.import_root
+    if not root or str(root) in ("", "."):
+        raise HTTPException(status_code=400, detail="IMPORT_ROOT not configured")
+    root = Path(root).resolve()
+    target = (root / payload.path).resolve()
+    # Containment check: refuse anything that escapes the configured root.
+    if target != root and root not in target.parents:
+        raise HTTPException(status_code=400, detail="path escapes IMPORT_ROOT")
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail="directory not found")
+
+    files = sorted(
+        p for p in (target.rglob("*") if payload.recurse else target.glob("*"))
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
+    )
+    out: list[SongRead] = []
+    for path in files:
+        digest = content_digest([path.read_bytes()])  # stream if files get huge
+        title, artist = guess_metadata(path.name)
+        song, _ = await _ingest_local_path(
+            path, song_key=f"local-{digest[:16]}",
+            title=title, artist=artist, db=db, process_now=payload.process_now,
+        )
+        sr = SongRead.model_validate(song)
+        sr.has_stems, sr.has_transcription = False, False
+        out.append(sr)
+    return out
