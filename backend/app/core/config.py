@@ -23,7 +23,16 @@ class Settings(BaseSettings):
     s3_access_key: str = ""
     s3_secret_key: str = ""
     s3_region_name: str = "auto"
-    
+
+    # Local-file import: cap a single upload so a 2 GB DJ set can't pin a
+    # threadpool worker forever. 300 MB covers ~6 h of 320 kbps MP3.
+    music_max_upload_mb: float = 300.0
+
+    # Optional server-side folder import. Empty = disabled. Must be an
+    # absolute path that exists *inside* the backend container (bind-mount
+    # your music folder in docker-compose to use this).
+    import_root: Path = Path("")
+
     modal_token_id: str = ""
     modal_token_secret: str = ""
     
