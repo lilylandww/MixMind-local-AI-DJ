@@ -93,6 +93,20 @@ uv run ruff check app alembic          # 2 pre-existing findings, none in new co
 npx tsc --noEmit && npm run lint && npm run build   # clean (1 pre-existing api.ts error)
 ```
 
+## Publish
+
+Repo published to **https://github.com/lilylandww/MixMind-local-AI-DJ** (public), per
+user instruction to "create a repo, then push the code". `main` and
+`feat/lrc-multilingual-stt` were pushed; `feat/local-file-import` stays local (its
+commits are in today's branch history anyway). The pre-existing `origin`
+(`Intellligent15/MixMind--AI-DJ`, public, last pushed 2026-07-04) was renamed to
+`upstream-public` so nothing is lost and `git push` targets the new repo.
+
+**Nothing large or secret was published.** `.gitignore` already keeps `cache/`,
+`node_modules/`, `.venv/`, `.next/`, `cookies.txt` and `.env` local; the largest
+tracked file is `backend/uv.lock` at 366 KB and total history is 3.4 MB. Only
+`.env.example` is tracked, so no keys left the machine.
+
 ## Not done / follow-ups
 
 - **MMS_FA needs a real smoke test** on a machine with `torchaudio` — only its pure
