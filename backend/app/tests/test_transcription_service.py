@@ -13,6 +13,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.services.transcription import TranscriptionService
+from app.services.transcription.service import (
+    WHISPER_OPTIONS,
+    build_options,
+    default_model_repo,
+)
 
 
 def _stub_raw(
@@ -178,6 +183,56 @@ def test_transcribe_empty_result_zero_duration():
     assert result.language is None
 
 
+def test_transcribe_auto_detects_language_by_default():
+    """Multilingual queues must not be pinned to one language. A forced
+    "en" decodes Japanese vocals as English gibberish."""
+    svc = TranscriptionService()
+    assert svc.language is None
+    with patch(
+        "app.services.transcription.service.mlx_whisper.transcribe",
+        return_value=_stub_raw(language="ja"),
+    ) as mock_transcribe:
+        result = svc.transcribe(Path("/fake/vocals.wav"))
+
+    _, kwargs = mock_transcribe.call_args
+    assert kwargs.get("language") is None
+    assert result.language == "ja"
+
+
+def test_transcribe_honours_explicit_language():
+    """A per-song hint (e.g. the script of its .lrc) pins the decode."""
+    svc = TranscriptionService(language="ja")
+    with patch(
+        "app.services.transcription.service.mlx_whisper.transcribe",
+        return_value=_stub_raw(language="ja"),
+    ) as mock_transcribe:
+        svc.transcribe(Path("/fake/vocals.wav"))
+
+    _, kwargs = mock_transcribe.call_args
+    assert kwargs.get("language") == "ja"
+
+
+def test_model_name_and_repo_follow_settings():
+    assert default_model_repo("large-v3") == "mlx-community/whisper-large-v3-mlx"
+    svc = TranscriptionService(model_name="medium")
+    assert svc.model_name == "medium"
+    assert svc.model_repo == "mlx-community/whisper-medium-mlx"
+    # An explicit repo wins over the derived name.
+    svc = TranscriptionService(
+        model_name="large-v3", model_repo="mlx-community/whisper-large-v3-bf16-mlx"
+    )
+    assert svc.model_repo == "mlx-community/whisper-large-v3-bf16-mlx"
+
+
+def test_build_options_leaves_base_set_untouched():
+    """build_options copies — mutating one call must not leak language
+    into the next (a module-level dict would)."""
+    assert build_options("ja")["language"] == "ja"
+    assert build_options()["language"] is None
+    assert build_options("")["language"] is None
+    assert WHISPER_OPTIONS["language"] is None
+
+
 def test_transcribe_passes_full_override_set():
     """Every override from WHISPER_OPTIONS must flow through to mlx-whisper.
 
@@ -211,7 +266,10 @@ def test_transcribe_passes_full_override_set():
     assert kwargs.get("clip_timestamps") == "0"
 
     # Decoder options
-    assert kwargs.get("language") == "en"
+    # Language is auto-detected by default — pinning "en" here would
+    # transcribe every non-English vocal in a multilingual queue as
+    # English gibberish. See the dedicated language tests below.
+    assert kwargs.get("language") is None
     assert kwargs.get("task") == "transcribe"
     # beam_size is intentionally NOT passed — mlx-whisper hasn't
     # implemented beam search yet and raises NotImplementedError if it's

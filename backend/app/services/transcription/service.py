@@ -1,10 +1,29 @@
 from __future__ import annotations
 
 import logging
+import types
 from dataclasses import dataclass
 from pathlib import Path
 
-import mlx_whisper
+from app.core.config import settings
+
+
+def _unavailable_transcribe(*args, **kwargs):
+    raise RuntimeError(
+        "mlx_whisper is not installed. Install the `worker` dependency "
+        "group on Apple Silicon, or set MODAL_TOKEN_ID to run "
+        "transcription on the GPU workers."
+    )
+
+
+try:
+    import mlx_whisper
+except ImportError:  # pragma: no cover - slim Linux worker image / CI
+    # Bind a stand-in so `mlx_whisper.transcribe` stays *patchable* on
+    # hosts without the MLX stack. Without this the whole module fails to
+    # import and every normalization test silently disappears from the
+    # run on Linux — exactly where the Modal path is exercised.
+    mlx_whisper = types.SimpleNamespace(transcribe=_unavailable_transcribe)
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +37,12 @@ logger = logging.getLogger(__name__)
 # mlx-whisper downloads + caches the weights from HuggingFace on first
 # call; subsequent calls are fast. Transcription.model_name is stored
 # per-row so historical rows from earlier model choices stay accurate.
-DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-mlx"
 DEFAULT_MODEL_NAME = "large-v3"
+
+
+def default_model_repo(model_name: str) -> str:
+    """HuggingFace repo holding the MLX conversion of `model_name`."""
+    return f"mlx-community/whisper-{model_name}-mlx"
 
 
 # Full mlx-whisper override set. Kept as a module-level dict so tuning is
@@ -73,11 +96,11 @@ WHISPER_OPTIONS: dict = {
     "clip_timestamps": "0",
 
     # --- Decoder options (mlx-whisper routes these to DecodingOptions) ---
-    # Force English. Speeds up first-pass (skips lang detect) and
-    # prevents accidental non-English decoding on instrumental-heavy
-    # tracks where Whisper sometimes guesses Italian / Japanese. Change
-    # / remove if you start queueing multilingual songs.
-    "language": "en",
+    # Language is deliberately NOT pinned here — see build_options(). A
+    # multilingual playlist must auto-detect (or take a hint from the
+    # `.lrc` script); forcing English transcribes a Japanese vocal as
+    # English gibberish.
+    "language": None,
     "task": "transcribe",
     # mlx-whisper hasn't implemented beam search yet (decoding.py raises
     # NotImplementedError if beam_size is set), so we stick with greedy
@@ -97,6 +120,21 @@ WHISPER_OPTIONS: dict = {
     "prefix": None,
     "length_penalty": None,
 }
+
+
+def build_options(language: str | None = None) -> dict:
+    """The tuned override set, with the decode language resolved.
+
+    `language=None` (the default) means *auto-detect per song*, which is
+    what a multilingual queue needs. A non-empty value pins the decode,
+    which is faster (skips the detect pass) and steadier on instrumental
+    fragments where Whisper's detector is easily fooled — so
+    `WHISPER_LANGUAGE` stays available for a known-monolingual library,
+    and the `.lrc` script hint can pin it per song.
+    """
+    opts = dict(WHISPER_OPTIONS)
+    opts["language"] = language or None
+    return opts
 
 
 def _maybe_float(d: dict, key: str) -> float | None:
@@ -147,20 +185,31 @@ class TranscriptionService:
 
     def __init__(
         self,
-        model_repo: str = DEFAULT_MODEL_REPO,
-        model_name: str = DEFAULT_MODEL_NAME,
+        model_repo: str | None = None,
+        model_name: str | None = None,
+        language: str | None = None,
     ) -> None:
-        self.model_repo = model_repo
-        self.model_name = model_name
+        self.model_name = model_name or settings.whisper_model or DEFAULT_MODEL_NAME
+        self.model_repo = (
+            model_repo
+            or settings.whisper_model_repo
+            or default_model_repo(self.model_name)
+        )
+        # None = auto-detect. `language` (explicit, e.g. from an .lrc
+        # script hint) wins over the WHISPER_LANGUAGE setting.
+        self.language = language or settings.whisper_language or None
 
     def transcribe(self, vocals_path: Path) -> TranscriptionResult:
         logger.info(
-            "transcribing %s with mlx-whisper %s", vocals_path, self.model_repo
+            "transcribing %s with mlx-whisper %s (language=%s)",
+            vocals_path,
+            self.model_repo,
+            self.language or "auto",
         )
         raw = mlx_whisper.transcribe(
             str(vocals_path),
             path_or_hf_repo=self.model_repo,
-            **WHISPER_OPTIONS,
+            **build_options(self.language),
         )
 
         segments: list[dict] = []

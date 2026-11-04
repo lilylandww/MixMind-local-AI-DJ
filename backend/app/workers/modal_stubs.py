@@ -221,10 +221,18 @@ def run_transcription(
     s3_access_key: str,
     s3_secret: str,
     s3_region: str,
+    model_name: str = "large-v3",
+    language: str | None = None,
 ) -> dict:
-    """Whisper large-v3 transcription of the vocal stem. Mirrors the
-    shape of TranscriptionService.transcribe(): per-segment text + word-
-    level timing where available.
+    """Whisper transcription of the vocal stem. Mirrors the shape of
+    TranscriptionService.transcribe(): per-segment text + word-level
+    timing where available.
+
+    `model_name` and `language` mirror the local path's WHISPER_MODEL /
+    WHISPER_LANGUAGE settings so the two backends can't drift apart.
+    `language=None` (default) auto-detects per song — what a multilingual
+    queue needs; a non-empty value pins the decode and skips the detect
+    pass.
     """
     import json
     import tempfile
@@ -239,7 +247,7 @@ def run_transcription(
         local = td / "vocals.wav"
         s3.download_file(s3_bucket, vocals_key, str(local))
 
-        model = whisper.load_model("large-v3")
+        model = whisper.load_model(model_name or "large-v3")
         kwargs = {
             "word_timestamps": True,
             "verbose": False,
@@ -249,7 +257,11 @@ def run_transcription(
             "hallucination_silence_threshold": 1.5,
             "condition_on_previous_text": False,
             "temperature": (0.0, 0.2),
-            # No language= — let Whisper auto-detect to match the local path.
+            # None = auto-detect, matching the local path's default. A
+            # forced "en" here would decode a Japanese vocal as English
+            # gibberish on a multilingual queue.
+            "language": language or None,
+            "task": "transcribe",
             "best_of": 3,
             "suppress_tokens": [-1],
             "suppress_blank": True,
@@ -296,7 +308,7 @@ def run_transcription(
         "duration": float(result.get("duration", 0.0))
         if "duration" in result
         else None,
-        "model_name": "whisper-large-v3",
+        "model_name": f"whisper-{model_name or 'large-v3'}",
         "segments": segments,
     }
 

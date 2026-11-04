@@ -29,14 +29,14 @@ from app.core.db import SessionLocal, engine
 from app.models import Song  # noqa: F401 — ensure Song table is registered
 from app.services.storage import factory as _storage_factory
 
-# The worker-group tests need demucs + mlx-whisper, which only install via
-# `uv sync --group worker` and only on macOS (mlx is Apple-silicon-only).
-# On hosts without them these four files can't even be collected, which
-# would error out the whole run — ignore them up front. macOS native
-# workers (start-dev.sh) still collect and run every file below.
+# The worker-group tests need demucs, which only installs via
+# `uv sync --group worker`. On hosts without it these files can't even be
+# collected, which would error out the whole run — ignore them up front.
+# (The transcription tests no longer need mlx_whisper: the service binds a
+# patchable stand-in when the MLX stack is absent, so its normalization
+# and option-set tests run everywhere.)
 _WORKER_DEP_TESTS: dict[str, tuple[str, ...]] = {
     "demucs": ("test_separate_task.py", "test_stem_separation_service.py"),
-    "mlx_whisper": ("test_transcribe_task.py", "test_transcription_service.py"),
 }
 collect_ignore: list[str] = []
 for _dep, _files in _WORKER_DEP_TESTS.items():

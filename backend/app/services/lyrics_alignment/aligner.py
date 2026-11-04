@@ -1,12 +1,79 @@
+"""Align an authoritative lyric text against Whisper's word timings.
+
+Two reference sources reach here:
+
+* **Genius text** (no timing) — the whole lyric body is matched globally
+  against the Whisper transcript and words inherit Whisper's timestamps.
+* **`.lrc` sidecar** (timed) — passed as ``line_times``. Each line carries
+  its own timestamp, which lets us (a) constrain the match to the right
+  window so repeated choruses can't steal each other's timings, (b) fit a
+  time warp that absorbs the 0.5-2 s drift hand-made `.lrc` files almost
+  always carry, and (c) fall back to the *author's* own timing where
+  Whisper heard nothing.
+
+Output entries look like::
+
+    {"word", "start", "end", "confidence", "source"}
+
+``source`` is the provenance of the *timestamp* (not of the text — the
+text is always the authoritative reference):
+
+======================  ====================================================
+``whisper_match``       exact token match; timing from Whisper (fine, per
+                        word, DTW-derived)
+``whisper_substitution`` fuzzy/phonetic match; timing from Whisper, confidence
+                        scaled down
+``lrc_word``            timing from an enhanced ``<time>`` word tag
+``lrc_line``            timing estimated from the line's own timestamp
+``interpolated``        timing guessed between two anchored neighbours
+``unmapped``            no timing at all (``start``/``end`` are None)
+======================  ====================================================
+
+``app.services.vocal_safety`` trusts the first three outright and requires
+vocal-stem energy to corroborate the guessed ones.
+"""
+from __future__ import annotations
+
+import bisect
 import difflib
 import re
+import statistics
 from typing import Any
 
 from app.models.lyrics import LyricsAlignmentStatus
+from app.services.lyrics.tokenizer import clean_word, is_latin_word, tokenize
+
+# Assumed sung rate, used to place words when a `.lrc` line gives us a
+# start but no per-word times. ~170 wpm. Slightly generous so a slow
+# vocal line still covers all its words.
+SECONDS_PER_WORD = 0.35
+
+# How far a line's vocal may start before / spill past its own stamp when
+# the fit is used to bound the interpolation window. The transcript is
+# *partitioned* at the midpoints between consecutive lines (so windows
+# never overlap); these only pad the range used to spread a line whose
+# words Whisper missed entirely.
+LINE_LEAD_SLACK = 1.5
+LINE_TAIL_SLACK = 1.5
+
+# Below this Theil-Sen slope the `.lrc` and the audio are simply at the
+# same speed and only a constant offset is needed; outside 0.7-1.3 the
+# slope estimate is unreliable (too few anchors) so fall back to a
+# constant offset again.
+_WARP_SLOPE_MIN = 0.98
+_WARP_SLOPE_MAX = 1.02
+_WARP_SLOPE_ABS_MIN = 0.7
+_WARP_SLOPE_ABS_MAX = 1.3
+_MIN_ANCHORS_FOR_SLOPE = 4
 
 
 def _clean_word(w: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", w.lower())
+    """See ``app.services.lyrics.tokenizer.clean_word``.
+
+    Kept as a module-level alias so the normaliser is one import away and
+    older call sites keep working.
+    """
+    return clean_word(w)
 
 
 _SOUNDEX_MAP = {
@@ -24,7 +91,12 @@ _SOUNDEX_TRANSPARENT = {"h", "w"}
 
 
 def _soundex(word: str) -> str:
-    """Classical American Soundex: first letter + up to 3 digit codes."""
+    """Classical American Soundex: first letter + up to 3 digit codes.
+
+    English phonotactics only. Callers gate it with
+    ``is_latin_word`` — the code is meaningless for CJK / Cyrillic /
+    Arabic and would make unrelated words collide.
+    """
     w = re.sub(r"[^a-z]", "", word.lower())
     if not w:
         return ""
@@ -87,101 +159,150 @@ def _expand_repeat_markers(text: str) -> str:
     return "\n".join(out)
 
 
-def align_lyrics(transcription_segments: list[dict[str, Any]], genius_text: str) -> dict[str, Any]:
-    """
-    Align authoritative Genius text with Whisper transcription timestamps.
-    Returns a dict with aligned_words, alignment_quality, and alignment_status.
-    """
-    if not genius_text:
-        return {
-            "aligned_words": [],
-            "alignment_quality": 0.0,
-            "alignment_status": LyricsAlignmentStatus.error,
-        }
+# --- reference / hypothesis tokenisation ------------------------------
 
-    # Split genius lyrics into words
-    # Remove bracketed section headers like [Chorus]
-    # NEW: strip section headers, then expand (×N) chorus markers
-    # before tokenising. Order matters — markers like (×3) sit on
-    # their own lines and must be visible to _expand_repeat_markers.
-    clean_text = re.sub(r"\[.*?\]", "", genius_text)
-    clean_text = _expand_repeat_markers(clean_text)
-    genius_words = [w for w in re.split(r"\s+", clean_text) if w]
-    genius_clean = [_clean_word(w) for w in genius_words]
 
-    whisper_words = []
-    for seg in transcription_segments:
-        for w in seg.get("words", []):
-            if w.get("word"):
-                whisper_words.append({
-                    "word": w["word"],
-                    "clean": _clean_word(w["word"]),
-                    "start": w["start"],
-                    "end": w["end"],
-                    "probability": w.get("probability", 1.0),
-                    "seg_logprob": seg.get("avg_logprob", 0.0),
+def _reference_tokens(words: list[str]) -> list[dict[str, Any]]:
+    return [{"word": w, "clean": _clean_word(w)} for w in words]
+
+
+def _flatten_transcript(segments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Whisper words -> alignment tokens.
+
+    Both sides must be tokenised identically or the diff is meaningless.
+    A Whisper "word" can hold several tokens (CJK arrives unspaced), so
+    each one is split and its timestamp span divided proportionally.
+    Single-token words keep their exact original boundaries so callers
+    can rely on end-of-transcript timestamps surviving untouched.
+    """
+    out: list[dict[str, Any]] = []
+    for seg in segments or []:
+        seg_logprob = seg.get("avg_logprob")
+        for w in seg.get("words") or []:
+            raw = w.get("word") or ""
+            if not raw:
+                continue
+            start, end = w.get("start"), w.get("end")
+            if start is None or end is None:
+                continue
+            toks = tokenize(raw)
+            if not toks:
+                continue
+            prob = w.get("probability")
+            if len(toks) == 1:
+                out.append({
+                    "word": toks[0],
+                    "clean": _clean_word(toks[0]),
+                    "start": float(start),
+                    "end": float(end),
+                    "probability": prob,
+                    "seg_logprob": seg_logprob,
                 })
+                continue
+            span = max(float(end) - float(start), 1e-3)
+            for i, t in enumerate(toks):
+                out.append({
+                    "word": t,
+                    "clean": _clean_word(t),
+                    "start": float(start) + span * i / len(toks),
+                    "end": float(start) + span * (i + 1) / len(toks),
+                    "probability": prob,
+                    "seg_logprob": seg_logprob,
+                })
+    return out
 
-    w_clean = [w["clean"] for w in whisper_words]
 
-    matcher = difflib.SequenceMatcher(None, genius_clean, w_clean)
+def _phonetic_hit(ref_clean: str, hyp_clean: str) -> bool:
+    """Soundex collision, but only where Soundex means anything."""
+    if not (is_latin_word(ref_clean) and is_latin_word(hyp_clean)):
+        return False
+    a, b = _soundex(ref_clean), _soundex(hyp_clean)
+    return bool(a) and a == b
 
-    aligned = []
+
+def _align_opcodes(
+    ref: list[dict[str, Any]], hyp: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """difflib match of reference tokens against transcript tokens.
+
+    Returns one entry per reference token with Whisper's timing attached
+    where a counterpart was found. Hypothesis-only tokens are dropped
+    (Whisper ad-libs, backing "oh-oh"s) — the reference text is what the
+    player and the planner show.
+    """
+    matcher = difflib.SequenceMatcher(
+        None, [r["clean"] for r in ref], [h["clean"] for h in hyp]
+    )
+
+    aligned: list[dict[str, Any]] = []
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             for i, j in zip(range(i1, i2), range(j1, j2)):
-                w = whisper_words[j]
+                h = hyp[j]
                 aligned.append({
-                    "word": genius_words[i],
-                    "start": w["start"],
-                    "end": w["end"],
-                    "confidence": w["probability"],
+                    "word": ref[i]["word"],
+                    "start": h["start"],
+                    "end": h["end"],
+                    "confidence": h["probability"] if h["probability"] is not None else 1.0,
                     "source": "whisper_match",
+                    "_ref": ref[i],
                 })
         elif tag == "replace":
             for idx, i in enumerate(range(i1, i2)):
                 j = j1 + idx
                 if j < j2:
-                    w = whisper_words[j]
-                    g_phon = _soundex(genius_clean[i])
-                    w_phon = _soundex(w["clean"])
+                    h = hyp[j]
                     # Phonetic match → trustworthy timing despite wrong
                     # word ("there"/"their"). Non-phonetic → likely
                     # pairing two unrelated words; low conf.
-                    phonetic_hit = bool(g_phon) and g_phon == w_phon
-                    sub_factor = 0.7 if phonetic_hit else 0.4
+                    hit = _phonetic_hit(ref[i]["clean"], h["clean"])
+                    factor = 0.7 if hit else 0.4
+                    prob = h["probability"] if h["probability"] is not None else 1.0
                     aligned.append({
-                        "word": genius_words[i],
-                        "start": w["start"],
-                        "end": w["end"],
-                        "confidence": w["probability"] * sub_factor,
+                        "word": ref[i]["word"],
+                        "start": h["start"],
+                        "end": h["end"],
+                        "confidence": prob * factor,
                         "source": "whisper_substitution",
-                        # Internal bookkeeping — stripped before return.
-                        "_phonetic_hit": phonetic_hit,
+                        "_ref": ref[i],
+                        "_phonetic_hit": hit,
                     })
                 else:
                     aligned.append({
-                        "word": genius_words[i],
+                        "word": ref[i]["word"],
                         "start": None,
                         "end": None,
                         "confidence": 0.0,
                         "source": "unmapped",
+                        "_ref": ref[i],
                     })
         elif tag == "delete":
             for i in range(i1, i2):
                 aligned.append({
-                    "word": genius_words[i],
+                    "word": ref[i]["word"],
                     "start": None,
                     "end": None,
                     "confidence": 0.0,
                     "source": "unmapped",
+                    "_ref": ref[i],
                 })
         elif tag == "insert":
-            # Words in Whisper not in Genius. Drop them.
+            # Words in Whisper not in the reference. Drop them.
             pass
+    return aligned
 
-    # Pass 2: Interpolate missing timestamps. Non-zero duration for
-    # interpolated words; leave None when neither neighbour anchors.
+
+def _interpolate(
+    aligned: list[dict[str, Any]],
+    window: tuple[float, float] | None = None,
+) -> None:
+    """Fill in missing timestamps in place.
+
+    Non-zero duration for interpolated words. When `window` is given (the
+    `.lrc` path) a run with no anchor at all is spread across the window
+    instead of being left untimed — the line's own timestamp already
+    bounds it, so leaving it None would throw away information we have.
+    """
     for i, a in enumerate(aligned):
         if a["start"] is not None:
             continue
@@ -217,28 +338,41 @@ def align_lyrics(transcription_segments: list[dict[str, Any]], genius_text: str)
             a["start"] = max(0.0, next_start - 0.15)
             a["end"] = max(0.0, next_start - 0.05)
             a["source"] = "interpolated"
+        elif window is not None:
+            lo, hi = window
+            # Whole line unmatched — the `.lrc` still tells us the vocal
+            # lives inside this window, so spread the words through it.
+            missing = [k for k in range(len(aligned)) if aligned[k]["start"] is None]
+            span = max(hi - lo, SECONDS_PER_WORD * len(missing))
+            per_word = span / max(len(missing), 1)
+            for rank, k in enumerate(missing):
+                t = lo + rank * per_word
+                aligned[k]["start"] = t
+                aligned[k]["end"] = t + per_word
+                aligned[k]["source"] = "lrc_line"
+            return
         else:
             # No anchor on either side — leave timestamps None.
             # Downstream consumers (vocal_safety) must skip these.
             a["source"] = "interpolated"
             # a["start"] and a["end"] remain None.
 
+
+def _score(aligned: list[dict[str, Any]]) -> tuple[float, LyricsAlignmentStatus]:
     # Weight matches 1.0, phonetic subs 0.5, other subs 0.1.
     # Interpolations contribute 0 but count toward the denominator so
     # alignments with many gaps are correctly flagged low_quality.
-    matches = 0
-    phonetic_subs = 0
-    other_subs = 0
-    interpolated_count = 0
+    matches = phonetic_subs = other_subs = interpolated_count = 0
     for a in aligned:
-        if a["source"] == "whisper_match":
+        src = a["source"]
+        if src in ("whisper_match", "lrc_word"):
             matches += 1
-        elif a["source"] == "whisper_substitution":
+        elif src == "whisper_substitution":
             if a.get("_phonetic_hit"):
                 phonetic_subs += 1
             else:
                 other_subs += 1
-        elif a["source"] == "interpolated":
+        elif src in ("interpolated", "lrc_line"):
             interpolated_count += 1
 
     denom = matches + phonetic_subs + other_subs + interpolated_count
@@ -251,12 +385,292 @@ def align_lyrics(transcription_segments: list[dict[str, Any]], genius_text: str)
         if quality < 0.3
         else LyricsAlignmentStatus.success
     )
+    return quality, status
 
+
+def _finish(aligned: list[dict[str, Any]]) -> dict[str, Any]:
+    # Score first: _phonetic_hit is what distinguishes a 0.5-weight
+    # phonetic substitution from a 0.1-weight one.
+    quality, status = _score(aligned)
     for a in aligned:
         a.pop("_phonetic_hit", None)
-
+        a.pop("_ref", None)
     return {
         "aligned_words": aligned,
         "alignment_quality": quality,
         "alignment_status": status,
     }
+
+
+# --- Genius (untimed) path --------------------------------------------
+
+
+def _align_free(hyp: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+    clean_text = re.sub(r"\[.*?\]", "", text)
+    clean_text = _expand_repeat_markers(clean_text)
+    ref = _reference_tokens(tokenize(clean_text))
+    aligned = _align_opcodes(ref, hyp)
+    _interpolate(aligned)
+    return aligned
+
+
+# --- `.lrc` (timed) path ----------------------------------------------
+
+
+def _line_reference(line: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reference tokens for one `.lrc` line, each with a nominal time.
+
+    Enhanced ``<time>`` word tags win when present. Otherwise words are
+    packed from the line's own start at ``SECONDS_PER_WORD`` rather than
+    spread to the next line — the gap after a line is usually an
+    instrumental, and smearing words across it would claim vocal energy
+    that isn't there.
+    """
+    words = line.get("words") or []
+    if words:
+        out: list[dict[str, Any]] = []
+        for i, w in enumerate(words):
+            toks = tokenize(w.get("text") or "")
+            if not toks:
+                continue
+            start = w.get("start")
+            nxt = next(
+                (words[j].get("start") for j in range(i + 1, len(words))
+                 if words[j].get("start") is not None),
+                None,
+            )
+            if start is None or nxt is None or nxt <= start:
+                times = [start] * len(toks)
+            else:
+                step = (nxt - start) / len(toks)
+                times = [start + k * step for k in range(len(toks))]
+            for t, ts in zip(toks, times):
+                out.append({"word": t, "clean": _clean_word(t), "nominal": ts, "fine": True})
+        return out
+
+    toks = tokenize(line.get("text") or "")
+    start = line.get("start")
+    if not toks:
+        return []
+    if start is None:
+        return [{"word": t, "clean": _clean_word(t), "nominal": None, "fine": False} for t in toks]
+    end = line.get("end")
+    span = min(SECONDS_PER_WORD * len(toks), max((end or start) - start, SECONDS_PER_WORD))
+    step = span / len(toks)
+    return [
+        {"word": t, "clean": _clean_word(t), "nominal": start + k * step, "fine": False}
+        for k, t in enumerate(toks)
+    ]
+
+
+def _estimate_warp(pairs: list[tuple[float, float]]):
+    """Fit ``lrc_time -> audio_time`` from matched anchor pairs.
+
+    Hand-made `.lrc` files are routinely shifted by a second or two, and
+    some are stretched (recorded from a different master). A Theil-Sen
+    slope — the median of all pairwise slopes — absorbs both and shrugs
+    off the bogus anchors a fuzzy match will occasionally produce.
+
+    Returns ``(offset, slope)`` so the caller can report what it applied.
+    """
+    if not pairs:
+        return 0.0, 1.0
+
+    if len(pairs) >= _MIN_ANCHORS_FOR_SLOPE:
+        xs = [p[0] for p in pairs]
+        if max(xs) - min(xs) > 5.0:
+            slopes = [
+                (pairs[j][1] - pairs[i][1]) / (pairs[j][0] - pairs[i][0])
+                for i in range(len(pairs))
+                for j in range(i + 1, len(pairs))
+                if abs(pairs[j][0] - pairs[i][0]) > 1e-3
+            ]
+            if slopes:
+                slope = statistics.median(slopes)
+                plausible = (
+                    _WARP_SLOPE_ABS_MIN <= slope <= _WARP_SLOPE_ABS_MAX
+                )
+                drifted = not (_WARP_SLOPE_MIN <= slope <= _WARP_SLOPE_MAX)
+                if plausible and drifted:
+                    offset = statistics.median(y - slope * x for x, y in pairs)
+                    return offset, slope
+
+    offset = statistics.median(y - x for x, y in pairs)
+    return offset, 1.0
+
+
+def _align_with_lines(
+    hyp: list[dict[str, Any]],
+    lines: list[dict[str, Any]],
+    warp_params: tuple[float, float] | None = None,
+) -> tuple[list[dict[str, Any]], float, float]:
+    """Constrained alignment using `.lrc` line timestamps.
+
+    A global free match is what breaks on a chorus sung three times: the
+    diff happily binds the second occurrence's words to the third
+    occurrence's Whisper words. Bounding each line to its own time window
+    makes that impossible.
+
+    Timing provenance per token, best available:
+    Whisper (fine, per-word) -> `.lrc` word tag -> the line's own stamp.
+
+    `warp_params` supplies a previously fitted ``(offset, slope)`` instead
+    of re-estimating one, so re-runs stay stable.
+    """
+    prepared: list[dict[str, Any]] = []
+    for line in sorted(lines, key=lambda d: d.get("start") is None):
+        ref = _line_reference(line)
+        if ref:
+            prepared.append({"ref": ref, "line": line})
+    if not prepared:
+        return [], 0.0, 1.0
+
+    if warp_params is not None:
+        offset, slope = warp_params
+    else:
+        # Pass 1: a cheap global match, used only to fit the time warp.
+        flat_ref = [r for p in prepared for r in p["ref"]]
+        warp_pairs = [
+            (r["nominal"], a["start"])
+            for r, a in zip(flat_ref, _align_opcodes(flat_ref, hyp))
+            if a["source"] == "whisper_match" and r.get("nominal") is not None
+        ]
+        offset, slope = _estimate_warp(warp_pairs)
+
+    def warp(t: float) -> float:
+        return offset + slope * t
+
+    aligned: list[dict[str, Any]] = []
+    timed = [p for p in prepared if p["line"].get("start") is not None]
+    untimed = [p for p in prepared if p["line"].get("start") is None]
+
+    # Partition, don't window. A sliding window still lets a chorus's
+    # words reach back into the previous chorus; giving every transcript
+    # word to exactly one line (nearest warped line start, boundaries at
+    # the midpoints) makes cross-contamination impossible. Words that
+    # spill past a boundary are cheap to lose here — the `.lrc`'s own
+    # stamp is the fallback for anything unmatched.
+    warped = [warp(p["line"]["start"]) for p in timed]
+    bounds = [
+        (warped[i] + warped[i + 1]) / 2.0 for i in range(len(warped) - 1)
+    ]
+    slices: list[list[dict[str, Any]]] = [[] for _ in timed]
+    for h in hyp:
+        slices[bisect.bisect_left(bounds, h["start"])].append(h)
+
+    for entry, scoped in zip(timed, slices):
+        ref = entry["ref"]
+        line = entry["line"]
+        start = line.get("start")
+        nxt = line.get("end")
+        expected = SECONDS_PER_WORD * len(ref) + LINE_TAIL_SLACK
+        if nxt is not None:
+            expected = min(expected, max(nxt - start, SECONDS_PER_WORD))
+        window = (
+            warp(start) - LINE_LEAD_SLACK,
+            warp(start) + expected + LINE_TAIL_SLACK,
+        )
+        _merge_line(ref, scoped, window, aligned)
+
+    # Lines with no stamp at all can't be partitioned; match them against
+    # the whole transcript. `Lyrics.line_timestamps` never carries these
+    # (an unsynced `.lrc` yields `[]` and the caller uses `reference_text`
+    # instead), so this only matters for hand-built payloads.
+    for entry in untimed:
+        _merge_line(entry["ref"], hyp, None, aligned)
+
+    return aligned, offset, slope
+
+
+def _merge_line(
+    ref: list[dict[str, Any]],
+    scoped: list[dict[str, Any]],
+    window: tuple[float, float] | None,
+    out: list[dict[str, Any]],
+) -> None:
+    """Align one line's reference tokens against its transcript slice.
+
+    Timing provenance per token, best available: Whisper (fine, per-word)
+    -> `.lrc` word tag -> the line's own stamp.
+    """
+    line_aligned = _align_opcodes(ref, scoped)
+
+    # Fall back to the `.lrc`'s own timing wherever Whisper had nothing —
+    # an author's word stamp beats a guess.
+    for a in line_aligned:
+        if a["start"] is not None:
+            continue
+        nominal = a["_ref"].get("nominal")
+        if nominal is None:
+            continue
+        a["start"] = nominal
+        a["end"] = nominal + SECONDS_PER_WORD
+        a["source"] = "lrc_word" if a["_ref"].get("fine") else "lrc_line"
+        a["confidence"] = 1.0 if a["_ref"].get("fine") else 0.3
+
+    # Give every timed word a plausible end: the next word's start within
+    # the line beats a flat constant.
+    for a in line_aligned:
+        if a["start"] is None or a["end"] is not None:
+            continue
+        a["end"] = a["start"] + SECONDS_PER_WORD
+    for i in range(len(line_aligned) - 1):
+        a, b = line_aligned[i], line_aligned[i + 1]
+        if (
+            a["start"] is not None
+            and b["start"] is not None
+            and b["start"] > a["start"]
+        ):
+            a["end"] = b["start"]
+
+    _interpolate(line_aligned, window=window)
+    out.extend(line_aligned)
+
+
+# --- public API -------------------------------------------------------
+
+
+def align_lyrics(
+    transcription_segments: list[dict[str, Any]],
+    reference_text: str,
+    *,
+    line_times: list[dict[str, Any]] | None = None,
+    alignment_offset: float | None = None,
+    alignment_slope: float | None = None,
+) -> dict[str, Any]:
+    """Align authoritative lyric text with Whisper transcription timestamps.
+
+    Pass `line_times` (the persisted `Lyrics.line_timestamps` payload) when
+    a timed `.lrc` source exists — it produces markedly better word
+    boundaries on repeats and lets us recover timing for words Whisper
+    missed entirely. `reference_text` is then only a fallback.
+
+    Returns a dict with aligned_words, alignment_quality, and
+    alignment_status — plus, on the timed path, the `offset` and `slope`
+    of the fitted time warp so the caller can persist the drift
+    correction it discovered.
+
+    `alignment_offset` / `alignment_slope` supply a previously fitted warp
+    instead of re-estimating one, which keeps re-runs stable.
+    """
+    hyp = _flatten_transcript(transcription_segments)
+    warp_params: tuple[float, float] | None = None
+    if alignment_offset is not None:
+        warp_params = (float(alignment_offset), float(alignment_slope or 1.0))
+
+    if line_times:
+        aligned, offset, slope = _align_with_lines(hyp, line_times, warp_params)
+        if not aligned and reference_text:
+            aligned = _align_free(hyp, reference_text)
+        result = _finish(aligned)
+        result["offset"] = offset
+        result["slope"] = slope
+        return result
+
+    if not reference_text:
+        return {
+            "aligned_words": [],
+            "alignment_quality": 0.0,
+            "alignment_status": LyricsAlignmentStatus.error,
+        }
+    return _finish(_align_free(hyp, reference_text))
