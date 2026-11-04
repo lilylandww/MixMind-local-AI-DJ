@@ -13,6 +13,9 @@ dependencies = [
     "redis>=5.0,<6.0",
     "pydantic>=2.9,<3.0",
     "pydantic-settings>=2.5,<3.0",
+    # Multipart form parsing for POST /api/imports/audio (FastAPI refuses
+    # to register Form/UploadFile endpoints without it).
+    "python-multipart>=0.0.20,<0.1",
     "python-dotenv>=1.0,<2.0",
     "yt-dlp>=2026.3.17",
     "librosa>=0.11.0",

@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import feedback as feedback_api
+from app.api import imports as imports_api
 from app.api import mix_plans as mix_plans_api
 from app.api import queues as queues_api
 from app.api import search as search_api
@@ -26,6 +27,7 @@ app.add_middleware(
 
 app.include_router(search_api.router)
 app.include_router(songs_api.router)
+app.include_router(imports_api.router)
 app.include_router(queues_api.router)
 app.include_router(mix_plans_api.router)
 app.include_router(feedback_api.router)

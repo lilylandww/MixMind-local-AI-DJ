@@ -101,13 +101,24 @@ def align_lyrics_task(self: Any, song_id: uuid.UUID | str) -> str | None:
             return str(song_id)
 
         try:
-            result = align_lyrics(transcription.segments, lyrics.text or "")
+            result = align_lyrics(
+                transcription.segments,
+                lyrics.text or "",
+                line_times=lyrics.line_timestamps,
+            )
             lyrics.aligned_words = result["aligned_words"]
             lyrics.alignment_quality = result["alignment_quality"]
             lyrics.alignment_status = result["alignment_status"]
+            # Persist the fitted .lrc time warp (None on the untimed
+            # Genius path) so a re-run reuses it and the UI can show how
+            # far the sidecar had drifted.
+            lyrics.alignment_offset = result.get("offset")
+            lyrics.alignment_slope = result.get("slope")
             logger.info(
-                "align_lyrics: %s aligned, quality=%.2f",
-                song_id, lyrics.alignment_quality,
+                "align_lyrics: %s aligned (%s), quality=%.2f",
+                song_id,
+                "lrc-timed" if lyrics.line_timestamps else "free",
+                lyrics.alignment_quality,
             )
         except Exception as exc:
             logger.exception("align_lyrics: %s aligner raised", song_id)

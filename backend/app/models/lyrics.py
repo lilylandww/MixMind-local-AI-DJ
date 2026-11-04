@@ -27,6 +27,18 @@ class LyricsAlignmentStatus(str, enum.Enum):
     error = "error"
 
 
+class LyricsSource(str, enum.Enum):
+    """Where `Lyrics.text` / `line_timestamps` came from.
+
+    `lrc` beats `genius` whenever both exist: a sidecar belongs to this
+    exact recording, is already timed, and needs no network round trip.
+    """
+
+    genius = "genius"
+    lrc = "lrc"
+    embedded = "embedded"
+
+
 class Lyrics(Base):
     __tablename__ = "lyrics"
 
@@ -39,7 +51,7 @@ class Lyrics(Base):
         unique=True,
         nullable=False,
     )
-    
+
     genius_id: Mapped[int | None] = mapped_column(nullable=True)
     text: Mapped[str | None] = mapped_column(String, nullable=True)
     fetch_status: Mapped[LyricsFetchStatus] = mapped_column(
@@ -48,6 +60,21 @@ class Lyrics(Base):
         default=LyricsFetchStatus.not_attempted,
     )
 
+    source: Mapped[LyricsSource] = mapped_column(
+        Enum(LyricsSource, name="lyricssource"),
+        nullable=False,
+        default=LyricsSource.genius,
+    )
+    # Persisted LrcData.to_json(): [{"start", "end", "text", "words"}, ...].
+    # Null for untimed sources (Genius). Presence of this is what switches
+    # the aligner onto its line-constrained path.
+    line_timestamps: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB, nullable=True
+    )
+    # Script-derived Whisper language hint (e.g. "ja"), set when the lyric
+    # text can pin the language better than audio-only detection can.
+    language: Mapped[str | None] = mapped_column(String, nullable=True)
+
     aligned_words: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     alignment_status: Mapped[LyricsAlignmentStatus] = mapped_column(
         Enum(LyricsAlignmentStatus, name="lyricsalignmentstatus"),
@@ -55,5 +82,10 @@ class Lyrics(Base):
         default=LyricsAlignmentStatus.not_attempted,
     )
     alignment_quality: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Time warp fitted while aligning a timed .lrc: audio_time =
+    # alignment_offset + alignment_slope * lrc_time. Persists the drift
+    # correction so re-runs stay stable and the UI can show it.
+    alignment_offset: Mapped[float | None] = mapped_column(Float, nullable=True)
+    alignment_slope: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     song: Mapped["Song"] = relationship("Song")

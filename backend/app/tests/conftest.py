@@ -15,6 +15,7 @@ talk to (or rely on network access to) DO Spaces during pytest.
 
 from __future__ import annotations
 
+import importlib
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
@@ -27,6 +28,22 @@ from app.core.config import settings
 from app.core.db import SessionLocal, engine
 from app.models import Song  # noqa: F401 — ensure Song table is registered
 from app.services.storage import factory as _storage_factory
+
+# The worker-group tests need demucs, which only installs via
+# `uv sync --group worker`. On hosts without it these files can't even be
+# collected, which would error out the whole run — ignore them up front.
+# (The transcription tests no longer need mlx_whisper: the service binds a
+# patchable stand-in when the MLX stack is absent, so its normalization
+# and option-set tests run everywhere.)
+_WORKER_DEP_TESTS: dict[str, tuple[str, ...]] = {
+    "demucs": ("test_separate_task.py", "test_stem_separation_service.py"),
+}
+collect_ignore: list[str] = []
+for _dep, _files in _WORKER_DEP_TESTS.items():
+    try:
+        importlib.import_module(_dep)
+    except ImportError:
+        collect_ignore.extend(_files)
 
 
 @pytest.fixture(autouse=True, scope="session")

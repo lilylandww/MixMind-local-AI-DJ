@@ -235,6 +235,24 @@ def test_sweep_orphans_deleted(db_session, storage):
     assert asyncio.run(storage.exists("audio/valid.wav")) is True
 
 
+def test_sweep_spares_dotfiles(db_session, storage):
+    """The repo keeps .gitkeep placeholders inside the cache directories;
+    the orphan sweep must not reap them (they are not pipeline output)."""
+    db = db_session
+    song = _make_song(db, vid="dotkeep", accessed_days_ago=1)
+    _write_song_blobs(storage, song, audio=1_000_000)
+    asyncio.run(storage.write("audio/.gitkeep", b""))
+    asyncio.run(storage.write("stems/.gitkeep", b""))
+    asyncio.run(storage.write("audio/orphan.wav", b"x" * 1_000_000))
+
+    res = asyncio.run(enforce_cache_budget(db, storage, budget_bytes=10_000_000))
+
+    assert asyncio.run(storage.exists("audio/orphan.wav")) is False
+    assert asyncio.run(storage.exists("audio/.gitkeep")) is True
+    assert asyncio.run(storage.exists("stems/.gitkeep")) is True
+    assert res["orphans_deleted"] == 1
+
+
 def test_sweep_keeps_pitched_stems_for_queued_offsets(db_session, storage):
     """Preshift cache blobs matching a queue item's live pitch offset are
     NOT orphans; blobs for stale offsets and unqueued songs are."""

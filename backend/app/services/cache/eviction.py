@@ -185,6 +185,10 @@ async def enforce_cache_budget(
             key.startswith(SWEPT_PREFIXES)
             and not _is_protected(key)
             and key not in valid_keys
+            # Dotfiles are never orphans: the repo keeps .gitkeep
+            # placeholders inside these directories, and on S3 anything
+            # dot-prefixed was not written by the pipeline anyway.
+            and not key.rsplit("/", 1)[-1].startswith(".")
         ):
             try:
                 await storage.delete(key)

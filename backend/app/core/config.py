@@ -23,7 +23,16 @@ class Settings(BaseSettings):
     s3_access_key: str = ""
     s3_secret_key: str = ""
     s3_region_name: str = "auto"
-    
+
+    # Local-file import: cap a single upload so a 2 GB DJ set can't pin a
+    # threadpool worker forever. 300 MB covers ~6 h of 320 kbps MP3.
+    music_max_upload_mb: float = 300.0
+
+    # Optional server-side folder import. Empty = disabled. Must be an
+    # absolute path that exists *inside* the backend container (bind-mount
+    # your music folder in docker-compose to use this).
+    import_root: Path = Path("")
+
     modal_token_id: str = ""
     modal_token_secret: str = ""
     
@@ -125,5 +134,30 @@ class Settings(BaseSettings):
     # smoke-test clip) and well above silence — only true instrumentals
     # and ambient tracks land underneath.
     whisper_vocal_rms_threshold: float = 0.005
+
+    # --- Speech-to-text -------------------------------------------------
+    # Whisper weights to use. Maps to the MLX repo
+    # "mlx-community/whisper-<model>-mlx" on Apple Silicon and to
+    # `whisper.load_model("<model>")` on the Modal/CUDA path. large-v3 is
+    # the spec-locked choice; see app/services/transcription/service.py
+    # for why turbo was rejected.
+    whisper_model: str = "large-v3"
+    # Full HuggingFace repo for the MLX weights, when the derived
+    # "mlx-community/whisper-<model>-mlx" name is not the one you want
+    # (e.g. a bfloat16 or distilled conversion). Empty = derive it.
+    whisper_model_repo: str = ""
+    # Force a decode language. Empty (default) = auto-detect per song,
+    # which is what a multilingual playlist needs. Set this only to pin
+    # one language for a known-monolingual library.
+    whisper_language: str = ""
+    # Reuse known lyric text as the transcript and just *align* it to the
+    # audio, instead of asking Whisper to recognise the words. Requires a
+    # `.lrc` sidecar (or embedded lyrics) with usable text; falls back to
+    # Whisper whenever that's missing or the aligner fails. Skips the
+    # Whisper decode entirely on those songs, which is much faster, and
+    # produces better word boundaries because the text can't be
+    # misheard. See app/services/lyrics_alignment/forced_align.py.
+    forced_align_enabled: bool = False
+    forced_align_backend: str = "mms_fa"  # mms_fa
 
 settings = Settings()

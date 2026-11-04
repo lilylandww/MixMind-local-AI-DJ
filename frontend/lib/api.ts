@@ -59,13 +59,53 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export type ImportResult = Song;
+
+/** Multipart upload with real progress — fetch() can't report upload bytes,
+ * and request() hardcodes the JSON Content-Type, so this is its own XHR
+ * helper. Mirrors POST /api/imports/audio. */
+export function importAudio(
+  input: {
+    file: File;
+    /** Optional `.lrc` lyric sidecar for `file`. Stored as the song's
+     * lyric source and used to time (and optionally replace) Whisper. */
+    lrcFile?: File;
+    title?: string;
+    artist?: string;
+    processNow?: boolean;
+  },
+  onProgress?: (fraction: number) => void,
+): Promise<ImportResult> {
+  return new Promise((resolve, reject) => {
+    const fd = new FormData();
+    fd.append("file", input.file);
+    if (input.lrcFile) fd.append("lrc_file", input.lrcFile);
+    if (input.title) fd.append("title", input.title);
+    if (input.artist) fd.append("artist", input.artist);
+    if (input.processNow) fd.append("process_now", "true");
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_BASE}/api/imports/audio`);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(JSON.parse(xhr.responseText) as ImportResult);
+      } else {
+        reject(new Error(`${xhr.status}: ${xhr.responseText}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("upload failed (network)"));
+    xhr.send(fd);
+  });
+}
+
 export type Section = {
   start: number;
   end: number;
   label: string;
-};
-
-export type Analysis = {
+};export type Analysis = {
   id: string;
   song_id: string;
   bpm: number;
@@ -301,6 +341,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+  importAudio,
   getSong: (id: string) => request<Song>(`/api/songs/${id}`),
   deleteSong: (id: string) =>
     request<void>(`/api/songs/${id}`, { method: "DELETE" }),

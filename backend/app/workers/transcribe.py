@@ -20,8 +20,9 @@ from app.workers import celery_app
 # Duplicated from app.services.transcription so this module can be imported
 # without pulling in mlx_whisper (which is macOS/MLX-only — the slim Linux
 # worker image on the droplet doesn't ship it, since heavy transcription
-# goes via Modal).
-DEFAULT_MODEL_NAME = "large-v3"
+# goes via Modal). Kept in sync with Settings.whisper_model rather than
+# hardcoded, so `WHISPER_MODEL` actually means something.
+DEFAULT_MODEL_NAME = settings.whisper_model or "large-v3"
 
 # Bind TranscriptionService at module top *if* the local stack is installed.
 # On macOS dev / native worker this lets unit tests `patch(
@@ -170,7 +171,19 @@ def transcribe_song(song_id: str) -> str | None:
         vocals_path = Path(tmpdir) / "vocals.wav"
 
         try:
-            if use_modal:
+            # Prefer forced alignment whenever we already hold the true
+            # lyric text: recognition is the wrong problem, and it can't
+            # mishear the words. Placed before the Whisper branch so it
+            # works for the Modal path too (it needs a local copy of the
+            # stem, which is cheap next to a GPU decode).
+            forced = None
+            if settings.forced_align_enabled:
+                asyncio.run(storage.download_file(vocals_key, vocals_path))
+                forced = _forced_align(song_uuid, vocals_path)
+
+            if forced is not None:
+                segments, language, duration_seconds, model_name = forced
+            elif use_modal:
                 import modal
 
                 fn = modal.Function.from_name(
@@ -184,6 +197,8 @@ def transcribe_song(song_id: str) -> str | None:
                     settings.s3_access_key,
                     settings.s3_secret_key,
                     settings.s3_region_name,
+                    settings.whisper_model,
+                    _language_hint(song_uuid),
                 )
                 # Modal returns segments inline (already JSON-shaped).
                 segments = result["segments"]
@@ -196,14 +211,19 @@ def transcribe_song(song_id: str) -> str | None:
                         "transcribe_song: local Whisper unavailable "
                         "(mlx_whisper not installed) and MODAL_TOKEN_ID unset"
                     )
-                service = TranscriptionService()
-                asyncio.run(storage.download_file(vocals_key, vocals_path))
+                if not vocals_path.exists():
+                    asyncio.run(storage.download_file(vocals_key, vocals_path))
+                # A per-song hint from the .lrc script beats audio-only
+                # detection for unspaced scripts; None = auto-detect.
+                service = TranscriptionService(
+                    language=_language_hint(song_uuid)
+                )
                 result = service.transcribe(vocals_path)
                 language = result.language
                 segments = result.segments
                 duration_seconds = result.duration_seconds
                 model_name = service.model_name
-                
+
         except Exception as exc:
             logger.exception("transcription failed for song %s", song_id)
             with SessionLocal() as db:
@@ -249,6 +269,77 @@ def transcribe_song(song_id: str) -> str | None:
     align_lyrics_task.delay(str(song_uuid))
 
     return str(song_uuid)
+
+
+def _lyrics_row(song_uuid: uuid.UUID):
+    from app.models import Lyrics
+
+    with SessionLocal() as db:
+        return db.scalar(select(Lyrics).where(Lyrics.song_id == song_uuid))
+
+
+def _language_hint(song_uuid: uuid.UUID) -> str | None:
+    """Whisper language pin from the lyric source, if it has one.
+
+    An `.lrc` written in kana / Hangul / bare ideographs pins the decode
+    far better than audio-only detection on a Demucs vocal stem, where
+    the detector is easily fooled by sparse or reverbed vocals. Latin
+    lyrics give no signal and we auto-detect as usual.
+    """
+    row = _lyrics_row(song_uuid)
+    return (row.language or None) if row is not None else None
+
+
+def _forced_align(song_uuid: uuid.UUID, vocals_path):
+    """Build segments from known lyric text instead of recognising it.
+
+    Returns ``(segments, language, duration_seconds, model_name)`` or
+    None to fall back to Whisper — no text to align against, or the
+    aligner's toolchain can't cover the script (see
+    app.services.lyrics_alignment.forced_align).
+    """
+    from app.services.lyrics.tokenizer import tokenize
+    from app.services.lyrics_alignment.forced_align import (
+        MODEL_NAME,
+        ForcedAlignUnavailable,
+        align_words,
+        segments_from_words,
+    )
+
+    row = _lyrics_row(song_uuid)
+    if row is None or not (row.text or "").strip():
+        logger.info(
+            "transcribe_song: %s has no known lyric text; using Whisper", song_id=song_uuid
+        )
+        return None
+
+    words = tokenize(row.text)
+    if not words:
+        return None
+
+    try:
+        placed = align_words(words, vocals_path, language=row.language)
+    except ForcedAlignUnavailable as exc:
+        logger.info(
+            "transcribe_song: %s forced-align unavailable (%s); falling back to Whisper",
+            song_uuid, exc,
+        )
+        return None
+
+    if not placed:
+        logger.info(
+            "transcribe_song: %s forced-align placed no words; falling back to Whisper",
+            song_uuid,
+        )
+        return None
+
+    segments = segments_from_words(placed)
+    duration = float(segments[-1]["end"]) if segments else 0.0
+    logger.info(
+        "transcribe_song: %s aligned %d known words to audio (%d segments)",
+        song_uuid, len(placed), len(segments),
+    )
+    return segments, row.language, duration, MODEL_NAME
 
 
 def _maybe_dispatch_stitch(song_uuid: uuid.UUID, db) -> None:

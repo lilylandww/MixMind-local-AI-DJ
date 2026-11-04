@@ -129,10 +129,11 @@ def _collect_from_alignment(
     rms_presence: float,
     peak_presence: float,
 ) -> list[tuple[float, float]]:
-    """Aligned-words path: trust ``whisper_match`` and
-    ``whisper_substitution`` outright (audio-supported by construction),
-    require audio support for ``interpolated`` (their timestamps are
-    guessed)."""
+    """Aligned-words path: trust the audio-anchored sources outright
+    (``whisper_match`` / ``whisper_substitution`` are backed by Whisper's
+    own decode; ``lrc_word`` is an author-typed word stamp) and require
+    vocal-stem energy to corroborate the estimated ones (``interpolated``,
+    ``lrc_line``) whose timestamps are guessed."""
     out: list[tuple[float, float]] = []
     for w in aligned_words:
         src = w.get("source")
@@ -140,9 +141,9 @@ def _collect_from_alignment(
         end = w.get("end")
         if start is None or end is None:
             continue
-        if src in ("whisper_match", "whisper_substitution"):
+        if src in ("whisper_match", "whisper_substitution", "lrc_word"):
             out.append((float(start), float(end)))
-        elif src == "interpolated":
+        elif src in ("interpolated", "lrc_line"):
             if _word_has_audio_support(
                 rms_list, peak_list, hop, start, end, rms_presence, peak_presence
             ):
@@ -160,13 +161,21 @@ def _collect_from_whisper(
     rms_presence: float,
     peak_presence: float,
 ) -> list[tuple[float, float]]:
-    """Raw-Whisper fallback. Applies spec's usable_vocal_word filter."""
+    """Raw-Whisper fallback. Applies spec's usable_vocal_word filter.
+
+    Confidence fields may be absent *or* null — a forced-aligned segment
+    carries no decode confidences at all (there was no hypothesis to be
+    unsure about: the text is known). Treat missing/null as passing, and
+    let the vocal-stem energy test be the guard instead.
+    """
     out: list[tuple[float, float]] = []
     for seg in segments or []:
-        if seg.get("avg_logprob", 0.0) < segment_logprob_min:
+        seg_logprob = seg.get("avg_logprob")
+        if seg_logprob is not None and seg_logprob < segment_logprob_min:
             continue
         for w in seg.get("words") or []:
-            if w.get("probability", 0.0) < word_prob_min:
+            prob = w.get("probability")
+            if prob is not None and prob < word_prob_min:
                 continue
             start = w.get("start")
             end = w.get("end")
