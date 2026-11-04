@@ -65,12 +65,21 @@ export type ImportResult = Song;
  * and request() hardcodes the JSON Content-Type, so this is its own XHR
  * helper. Mirrors POST /api/imports/audio. */
 export function importAudio(
-  input: { file: File; title?: string; artist?: string; processNow?: boolean },
+  input: {
+    file: File;
+    /** Optional `.lrc` lyric sidecar for `file`. Stored as the song's
+     * lyric source and used to time (and optionally replace) Whisper. */
+    lrcFile?: File;
+    title?: string;
+    artist?: string;
+    processNow?: boolean;
+  },
   onProgress?: (fraction: number) => void,
 ): Promise<ImportResult> {
   return new Promise((resolve, reject) => {
     const fd = new FormData();
     fd.append("file", input.file);
+    if (input.lrcFile) fd.append("lrc_file", input.lrcFile);
     if (input.title) fd.append("title", input.title);
     if (input.artist) fd.append("artist", input.artist);
     if (input.processNow) fd.append("process_now", "true");

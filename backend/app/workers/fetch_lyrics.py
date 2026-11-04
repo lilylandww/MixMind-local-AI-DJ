@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from app.workers import celery_app
 from app.core.db import SessionLocal
-from app.models.lyrics import Lyrics, LyricsFetchStatus
+from app.models.lyrics import Lyrics, LyricsFetchStatus, LyricsSource
 from app.models.song import Song
 from app.services.lyrics.genius import fetch_lyrics as genius_fetch
 
@@ -49,6 +49,16 @@ def fetch_lyrics_task(self: Any, song_id: uuid.UUID | str) -> str | None:
                     )
                     raise self.retry(countdown=30)
 
+
+        if lyrics.source == LyricsSource.lrc and lyrics.text:
+            # A local sidecar already holds the authoritative text for
+            # this exact recording. Genius would be a downgrade — and it
+            # must never overwrite a hand-supplied .lrc.
+            logger.info(f"fetch_lyrics: {song_id} has .lrc lyrics, skipping Genius")
+            if lyrics.fetch_status != LyricsFetchStatus.success:
+                lyrics.fetch_status = LyricsFetchStatus.success
+                db.commit()
+            return str(song_id)
 
         if lyrics.fetch_status == LyricsFetchStatus.success:
             logger.info(f"fetch_lyrics: {song_id} already has lyrics, skipping")

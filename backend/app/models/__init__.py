@@ -6,7 +6,12 @@ from app.models.queue_render import QueueRender, QueueRenderStatus
 from app.models.song import Song, SongStatus
 from app.models.stems import Stems, StemsStatus
 from app.models.transcription import Transcription, TranscriptionStatus
-from app.models.lyrics import Lyrics, LyricsFetchStatus, LyricsAlignmentStatus
+from app.models.lyrics import (
+    Lyrics,
+    LyricsAlignmentStatus,
+    LyricsFetchStatus,
+    LyricsSource,
+)
 
 __all__ = [
     "Analysis",
@@ -25,6 +30,7 @@ __all__ = [
     "Transcription",
     "TranscriptionStatus",
     "Lyrics",
-    "LyricsFetchStatus",
     "LyricsAlignmentStatus",
+    "LyricsFetchStatus",
+    "LyricsSource",
 ]

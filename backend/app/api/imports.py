@@ -20,10 +20,14 @@ from app.services.imports import (
     AUDIO_EXTENSIONS,
     NormalizeError,
     content_digest,
+    find_sidecar_lrc,
     guess_metadata,
     normalize_to_wav,
     probe_duration,
+    read_lrc,
 )
+from app.services.lyrics.ingest import attach_lrc
+from app.services.lyrics.lrc import LrcData, parse_lrc_bytes
 from app.services.storage import get_storage
 from app.workers import PRI_ANALYZE
 from app.workers.analyze import analyze_song
@@ -45,6 +49,32 @@ def _dedupe(db: Session, song_key: str) -> Song | None:
     return db.scalar(select(Song).where(Song.youtube_video_id == song_key))
 
 
+def _read_sidecar(path: Path) -> LrcData | None:
+    """Parse the `.lrc` next to `path`, if there is one. Never raises."""
+    sidecar = find_sidecar_lrc(path)
+    if sidecar is None:
+        return None
+    try:
+        return read_lrc(sidecar)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("import: unreadable sidecar %s", sidecar, exc_info=True)
+        return None
+
+
+def _maybe_attach_lrc(db: Session, song: Song, lrc_data: LrcData | None) -> None:
+    """Best-effort sidecar ingest.
+
+    Lyrics are strictly optional — a bad or unreadable `.lrc` must never
+    turn a successful audio import into a failure.
+    """
+    if lrc_data is None:
+        return
+    try:
+        attach_lrc(db, song.id, lrc_data)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("import: failed to attach .lrc for song %s", song.id)
+
+
 async def _ingest_local_path(
     src: Path,
     *,
@@ -53,15 +83,19 @@ async def _ingest_local_path(
     artist: str | None,
     db: Session,
     process_now: bool = False,
+    lrc_data: LrcData | None = None,
 ) -> tuple[Song, bool]:
     """Normalise `src` and persist a `downloaded` Song for it.
 
     Returns (song, created). `created=False` means an identical upload was
-    already in the library and nothing new was written.
+    already in the library and nothing new was written. `lrc_data`, when
+    given, is attached as the song's lyric source either way — re-importing
+    a folder is how a sidecar shows up after the fact.
     Idempotent on `song_key`, which is derived from the file's content hash.
     """
     existing = _dedupe(db, song_key)
     if existing is not None:
+        _maybe_attach_lrc(db, existing, lrc_data)
         return existing, False
 
     storage = get_storage()
@@ -108,6 +142,8 @@ async def _ingest_local_path(
         return winner, False
     db.refresh(song)
 
+    _maybe_attach_lrc(db, song, lrc_data)
+
     if process_now:
         analyze_song.apply_async(args=[str(song.id)], priority=PRI_ANALYZE)
 
@@ -120,6 +156,7 @@ async def import_audio(
     # Injecting it lets us downgrade 201 -> 200 on a dedupe hit.
     response: Response,
     file: UploadFile = File(...),
+    lrc_file: UploadFile | None = File(default=None),
     title: str | None = Form(default=None),
     artist: str | None = Form(default=None),
     process_now: bool = Form(default=False),
@@ -127,9 +164,13 @@ async def import_audio(
 ) -> SongRead:
     """Import one audio file from the user's machine.
 
-    Multipart form fields: `file` (required), `title`, `artist`,
-    `process_now`. Returns the created Song (201), or the existing Song for
-    an identical re-upload (200).
+    Multipart form fields: `file` (required), `lrc_file` (optional `.lrc`
+    lyric sidecar), `title`, `artist`, `process_now`. Returns the created
+    Song (201), or the existing Song for an identical re-upload (200).
+
+    `lrc_file` is the browser-upload analogue of the sidecar the folder
+    importer picks up automatically: a single-file upload has no real
+    directory for us to look in, so the client has to send it along.
     """
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in AUDIO_EXTENSIONS:
@@ -138,6 +179,12 @@ async def import_audio(
             detail=f"unsupported file type {suffix or '(none)'}; "
                    f"expected one of {sorted(AUDIO_EXTENSIONS)}",
         )
+
+    lrc_data: LrcData | None = None
+    if lrc_file is not None:
+        raw = await lrc_file.read()
+        if raw.strip():
+            lrc_data = parse_lrc_bytes(raw)
 
     max_bytes = int(settings.music_max_upload_mb * 1024 * 1024)
 
@@ -167,6 +214,7 @@ async def import_audio(
             artist=(artist or "").strip() or guessed_artist,
             db=db,
             process_now=process_now,
+            lrc_data=lrc_data,
         )
 
     if not created and response is not None:
@@ -193,6 +241,12 @@ async def import_folder(
     music folder into the backend container). `payload.path` is resolved
     relative to that root and may not escape it. Files already in the
     library (same content hash) come back unchanged instead of re-adding.
+
+    A `.lrc` sitting next to an audio file with the same stem is picked up
+    automatically and stored as that song's lyric source — see
+    `app.services.lyrics.ingest.attach_lrc`. That is the main reason to
+    use this endpoint over per-file upload: a library that already has
+    sidecar lyrics gets them with no extra work, and they beat Genius.
     """
     root = settings.import_root
     if not root or str(root) in ("", "."):
@@ -213,9 +267,11 @@ async def import_folder(
     for path in files:
         digest = content_digest([path.read_bytes()])  # stream if files get huge
         title, artist = guess_metadata(path.name)
+        lrc_data = _read_sidecar(path)
         song, _ = await _ingest_local_path(
             path, song_key=f"local-{digest[:16]}",
             title=title, artist=artist, db=db, process_now=payload.process_now,
+            lrc_data=lrc_data,
         )
         sr = SongRead.model_validate(song)
         sr.has_stems, sr.has_transcription = False, False

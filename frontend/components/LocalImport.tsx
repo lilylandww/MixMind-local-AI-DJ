@@ -4,7 +4,12 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef, useState } from "react";
 import { importAudio, type Song } from "@/lib/api";
 
-const AUDIO_ACCEPT = "audio/*,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus,.aiff,.aif,.wma";
+const AUDIO_ACCEPT = "audio/*,.mp3,.wav,.flac,.m4a,.aac,.ogg,.opus,.aiff,.aif,.wma,.lrc";
+
+const LRC_EXT = /\.(lrc)$/i;
+/** Lower-cased filename without its extension — the sidecar pairing key.
+ * `Track.mp3` pairs with `track.LRC`, same rule as the folder importer. */
+const stemOf = (name: string) => name.replace(/\.[^.]+$/, "").toLowerCase();
 
 // Mirrors _LEADING_TRACK_NO in backend/app/services/imports/audio.py so the
 // prefill the user sees matches what the server would guess. Duplicating
@@ -30,6 +35,8 @@ type FileState = "idle" | "uploading" | "done" | "error";
 type FileEntry = {
   id: string;
   file: File;
+  /** `.lrc` sidecar paired by filename stem, if the user supplied one. */
+  lrc?: File;
   title: string;
   artist: string;
   progress: number;
@@ -48,18 +55,36 @@ export function LocalImport() {
   const [importing, setImporting] = useState(false);
 
   const addFiles = useCallback((files: FileList | File[]) => {
-    const next: FileEntry[] = Array.from(files).map((file) => {
+    // Sidecars are keyed by filename stem, so `track.mp3` + `track.lrc`
+    // arrive as one entry. A `.lrc` dropped on its own attaches to
+    // whatever is still pending — "here's the lyrics for that one".
+    const lrcByStem = new Map<string, File>();
+    const audioFiles: File[] = [];
+    for (const file of Array.from(files)) {
+      if (LRC_EXT.test(file.name)) lrcByStem.set(stemOf(file.name), file);
+      else audioFiles.push(file);
+    }
+
+    const next: FileEntry[] = audioFiles.map((file) => {
       const guessed = guessMetadata(file.name);
       return {
         id: `f${++entrySeq}`,
         file,
+        lrc: lrcByStem.get(stemOf(file.name)),
         title: guessed.title,
         artist: guessed.artist,
         progress: 0,
         state: "idle",
       };
     });
-    setEntries((prev) => [...prev, ...next]);
+
+    setEntries((prev) => {
+      const patched = prev.map((e) => {
+        const lrc = lrcByStem.get(stemOf(e.file.name));
+        return e.state === "idle" && !e.lrc && lrc ? { ...e, lrc } : e;
+      });
+      return [...patched, ...next];
+    });
   }, []);
 
   const patchEntry = (id: string, patch: Partial<FileEntry>) => {
@@ -80,6 +105,7 @@ export function LocalImport() {
         const song: Song = await importAudio(
           {
             file: entry.file,
+            lrcFile: entry.lrc,
             title: entry.title,
             artist: entry.artist || undefined,
             processNow,
@@ -123,7 +149,9 @@ export function LocalImport() {
         }`}
       >
         <p className="text-sm opacity-70">
-          Drop audio files here (mp3 / wav / flac / m4a / ogg …)
+          Drop audio files here (mp3 / wav / flac / m4a / ogg …). Drop a
+          matching <code>.lrc</code> alongside and its lyrics are used
+          instead of a Genius lookup.
         </p>
         <input
           ref={inputRef}
@@ -160,6 +188,14 @@ export function LocalImport() {
                       ? `${Math.round(entry.progress * 100)}%`
                       : entry.state}
                   </span>
+                  {entry.lrc && (
+                    <span
+                      className="text-xs px-2 py-1 rounded bg-purple-500/20 whitespace-nowrap"
+                      title={`${entry.lrc.name} — lyric sidecar`}
+                    >
+                      lrc
+                    </span>
+                  )}
                   <div className="flex-1 min-w-0 flex gap-2">
                     <input
                       type="text"
