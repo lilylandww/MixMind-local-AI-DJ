@@ -14,12 +14,12 @@ app = FastAPI(title="MixMind Backend", version="0.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    # Local-dev frontend + the deployed droplet's public address. If we
-    # ever grow more deploy targets, expose this via settings; for a
-    # single droplet the static list is fine.
+    # Local-dev frontend only. CORS is not authentication — it decides which
+    # browsers may read a response, not who may call the API — so this stays
+    # narrow and the app stays on loopback (see README "Scope").
     allow_origins=[
         "http://localhost:3000",
-        "http://137.184.211.233:3000",
+        "http://127.0.0.1:3000",
     ],
     allow_methods=["*"],
     allow_headers=["*"],
