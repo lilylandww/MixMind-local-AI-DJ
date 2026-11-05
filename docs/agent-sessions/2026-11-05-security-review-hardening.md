@@ -5,19 +5,27 @@
 **Decisions taken:** retire the droplet deployment · do **not** rewrite git history ·
 do all mechanical fixes, defer the stitch-memory refactor.
 
-## ⚠️ Still outstanding — not fixable in code
+## Residual risk and ownership
 
-1. **The droplet credential is still valid until rotated, and still in git history.**
-   Rotation was deliberately left to the operator ("rotate only, leave history").
-   Removing `deploy/` stops *future* leaks; it does not revoke an already-public
-   password. The old `Intellligent15/MixMind--AI-DJ` repo has carried it since
-   ~2026-07.
-2. **Rotate every secret that lived on that host**, not just SSH: root access meant
-   `backend/.env` was readable, which holds `MODAL_TOKEN_ID/SECRET`,
-   `GEMINI_API_KEY`, `GROQ_API_KEY`, `DO_INFERENCE_API_KEY`, `GENIUS_ACCESS_TOKEN`,
-   `OPENAI_API_KEY`. The YouTube cookies should be treated as burned.
-3. Confirm the droplet is destroyed, not merely powered off — the IP may be
-   reassigned.
+**The credential is the upstream maintainer's, not this repository owner's.**
+`deploy/` was inherited from `Intellligent15/MixMind--AI-DJ`. So there is no
+rotation for the owner of this fork to perform — but three things are still true:
+
+1. **It is still a live credential in public history.** Deleting `deploy/` stops
+   *future* leaks; it does not revoke an already-published password. The upstream
+   repo has carried it since ~2026-07 and this fork republished it. The useful
+   action is to **notify the upstream maintainer**, who is the only party that can
+   rotate it or destroy the host. Whoever owns that droplet should also assume
+   `backend/.env` was readable — i.e. the Modal, Gemini, Groq, DO, Genius and
+   OpenAI keys that lived there are burned, plus the YouTube cookie session.
+2. **It should not have been in a script at all.** Deploy credentials belong in the
+   operator's environment or SSH config, never as a `${VAR:-default}` fallback in a
+   committed file. That is why the script is deleted rather than patched — a fork
+   that keeps the pattern will keep re-leaking it.
+3. **No secrets belonging to this repo's owner are tracked.** Full-history scan
+   found no `.env`, `.pem`, `.key`, `cookies.txt` or credential file; only
+   `.env.example` is committed. The generated local-stack passwords from this
+   session live in the gitignored `.env`.
 
 ## Findings and disposition
 
