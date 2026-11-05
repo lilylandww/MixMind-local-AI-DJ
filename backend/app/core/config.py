@@ -106,27 +106,14 @@ class Settings(BaseSettings):
     # openai voices like "onyx"/"nova"/"ash".
     tts_voice: str = "af_heart"
     openai_api_key: str = ""
-    # Default host frequency when the queue doesn't set one.
+    # Default host frequency when the queue doesn't set one:
+    # off | intro_only | sparse (intro + 1-2 mid-set) | chatty.
     host_frequency: str = "intro_only"  # off | intro_only | sparse | chatty
 
-    # TTS host (F11): the DJ voice — set intro + occasional mic drops,
-    # ducked under the music at stitch time.
-    # "kokoro" (default): Kokoro-82M, local and free, no API key.
-    # "openai": gpt-4o-mini-tts via the OpenAI API (needs openai_api_key).
-    # "off": never speak.
-    tts_provider: str = "kokoro"  # kokoro | openai | off
-    # Voice id per provider (kokoro: af_heart/am_michael/bf_emma/...;
-    # openai: alloy/ash/coral/onyx/nova/...).
-    tts_voice: str = "af_heart"
-    openai_api_key: str = ""
-    # Default mic-time when a queue doesn't set its own:
-    # off | intro_only | sparse (intro + 1-2 mid-set) | chatty.
-    host_frequency: str = "intro_only"
-
     # Path to a Netscape-format cookies.txt that yt-dlp passes to YouTube.
-    # Required on cloud hosts (the droplet) — YouTube's anti-bot system
-    # rejects datacenter IPs unless an authenticated session is presented.
-    # On macOS dev the residential IP is unblocked and this can stay empty.
+    # Some networks/hosts get anti-bot blocked unless an authenticated
+    # session is presented; on a residential connection this can stay
+    # empty. Treat the file as a credential — see README "Scope".
     yt_dlp_cookies_file: str = ""
 
     # Phase 6: skip Whisper if the Stems row's `vocal_rms` is below this
