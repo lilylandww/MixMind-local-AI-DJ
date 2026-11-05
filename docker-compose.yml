@@ -1,21 +1,35 @@
-# MixMind — base compose stack.
+# MixMind — base compose stack (local, single-user).
+#
+# SECURITY: this app has no authentication by design (see README "Scope"),
+# so nothing here may be published on a public interface. Every port binds
+# to 127.0.0.1. To reach it from another machine, forward the ports over
+# SSH (`ssh -L 3000:127.0.0.1:3000 -L 8000:127.0.0.1:8000 you@host`) or put
+# it on a private VPN — do not edit these to 0.0.0.0.
+#
+# Credentials come from the gitignored root `.env` and have NO committed
+# default: start-dev.sh generates them on first run. `docker compose` here
+# fails fast rather than falling back to a well-known password.
 #
 # The dockerized `worker` is profile-gated to `prod`. On macOS dev the
 # worker runs natively (start-dev.sh) so it can use MPS for Demucs/Whisper;
-# the compose worker would only race it. On the droplet:
+# the compose worker would only race it. On a Linux host with no native
+# GPU worker:
 #   COMPOSE_PROFILES=prod docker compose up -d --build
-# brings the worker container up — it has no GPU and delegates heavy ML
-# to Modal via app/workers/modal_stubs.py.
 
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: aidj
-      POSTGRES_PASSWORD: aidj
+      # No default on purpose. POSTGRES_PASSWORD only takes effect when the
+      # data directory is first initialised; start-dev.sh syncs an existing
+      # volume with ALTER USER, and the README documents the manual command.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
       POSTGRES_DB: aidj
     ports:
-      - "5432:5432"
+      # Host-loopback only: the native worker and the host `pytest` run
+      # connect via localhost. Not reachable from the LAN.
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -26,10 +40,16 @@ services:
 
   redis:
     image: redis:7-alpine
+    # requirepass, driven by the gitignored .env. An unauthenticated broker
+    # next to a Celery worker is remote code execution: anyone who can reach
+    # this port can enqueue download / separation / stitch tasks.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env (see .env.example)}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env (see .env.example)}
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 2s
       timeout: 3s
       retries: 20
@@ -39,11 +59,13 @@ services:
       context: ./backend
     env_file: ./backend/.env
     environment:
-      DATABASE_URL: postgresql+psycopg://aidj:aidj@postgres:5432/aidj
-      REDIS_URL: redis://redis:6379/0
+      # `environment` wins over `env_file`, so these authoritative values
+      # replace whatever stale URLs backend/.env happens to carry.
+      DATABASE_URL: postgresql+psycopg://aidj:${POSTGRES_PASSWORD}@postgres:5432/aidj
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       LOG_LEVEL: INFO
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,8 +84,8 @@ services:
     build:
       context: ./frontend
       args:
-        # Baked into the client bundle by Next.js. Override at build time
-        # for prod deploys, e.g. NEXT_PUBLIC_API_BASE=http://<droplet>:8000.
+        # Baked into the client bundle by Next.js; must match where the
+        # browser reaches the API. Loopback by default.
         NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
     environment:
       # Server-side fetches from the frontend container use docker network DNS.
@@ -72,7 +94,7 @@ services:
       # client-side code paths that re-read it (next dev hot-reload).
       NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - backend
 
@@ -83,11 +105,13 @@ services:
     command: ["celery", "-A", "app.workers", "worker", "--loglevel=INFO", "--pool=threads", "--concurrency=8"]
     env_file: ./backend/.env
     environment:
-      DATABASE_URL: postgresql+psycopg://aidj:aidj@postgres:5432/aidj
-      REDIS_URL: redis://redis:6379/0
-      # YouTube anti-bot blocks datacenter IPs unless yt-dlp passes a
-      # logged-in browser session. Drop a Netscape cookies.txt at
-      # ./cookies.txt on the droplet (gitignored) and yt-dlp will use it.
+      DATABASE_URL: postgresql+psycopg://aidj:${POSTGRES_PASSWORD}@postgres:5432/aidj
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      # YouTube anti-bot blocks some IPs unless yt-dlp presents a logged-in
+      # session. Drop a Netscape cookies.txt at ./cookies.txt (gitignored)
+      # and yt-dlp will use it. Optional — leave absent to download
+      # anonymously. Treat that session as a credential: it is only as safe
+      # as this app's (nonexistent) auth, so keep the app on loopback.
       YT_DLP_COOKIES_FILE: /app/cookies.txt
     depends_on:
       postgres:

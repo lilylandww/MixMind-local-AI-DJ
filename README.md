@@ -102,7 +102,6 @@ backend/    FastAPI app, Celery workers, Alembic migrations
 frontend/   Next.js app (App Router)
 cache/      Generated audio, stems, analyses, mixes (gitignored except .gitkeep)
 docs/       Feature designs and agent work logs
-deploy/     Droplet deployment script
 ```
 
 ## Prerequisites
@@ -136,7 +135,8 @@ defaults shown and can be set whenever you want to override one.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` / `REDIS_URL` | local dev values | Overridden to container hostnames inside Compose |
+| `POSTGRES_PASSWORD` / `REDIS_PASSWORD` | *generated* | Local stack credentials. `start-dev.sh` creates them in `.env` on first run; `docker-compose.yml` has **no default** and refuses to start without them. |
+| `DATABASE_URL` / `REDIS_URL` | derived | Host-side URLs for the native worker and `pytest`. Compose derives its own from the two passwords above. |
 | `STORAGE_BACKEND` | `local` | `local` or `s3` |
 | `LOCAL_STORAGE_PATH` | `./cache` | Where generated audio lives |
 | `CACHE_MAX_SIZE_GB` | `50` | LRU eviction budget for generated artifacts |
@@ -238,6 +238,33 @@ cd frontend && npm run test:e2e        # Playwright (stubbed backend)
 
 Linting: `cd backend && uv run ruff check app`.
 
-## Scope
+## Scope and security
 
-Single‑user, local‑first, no authentication. Not intended for multi‑tenant or public deployment as‑is.
+Single-user, local-first, **no authentication**. That's a design choice, not an
+oversight, and it has hard consequences:
+
+- **Never publish this on a public interface.** Every port in
+  `docker-compose.yml` binds to `127.0.0.1` for exactly this reason. To reach it
+  from another machine use an SSH tunnel
+  (`ssh -L 3000:127.0.0.1:3000 -L 8000:127.0.0.1:8000 you@host`) or a private
+  VPN. Rebinding those to `0.0.0.0` hands anonymous callers the ability to
+  delete your library, spend your Modal and LLM quota, and download as your
+  YouTube session.
+- **The Celery worker is the crown jewel.** Redis is its broker, so anyone who
+  reaches the broker can enqueue tasks the worker then *executes* (download,
+  separation, stitch). It requires a password and is loopback-bound.
+- **Stack credentials are generated, never committed.** `start-dev.sh` writes
+  `POSTGRES_PASSWORD` and `REDIS_PASSWORD` into the gitignored `.env` on first
+  run. Neither has a default in `docker-compose.yml` — it fails fast instead.
+  If you're upgrading an existing database, `POSTGRES_PASSWORD` only applies on
+  first volume init, so run
+  `docker compose exec -T postgres psql -U aidj -d aidj -c "ALTER USER aidj WITH PASSWORD '<new>'"`.
+- **CORS is not authentication.** It decides which origins may read a response,
+  not who may call the API.
+- **Search is search-only.** URL-shaped queries are rejected, because
+  `yt-dlp`'s `extract_info` would otherwise fetch them as-is — an SSRF primitive
+  aimed at the cloud metadata service and the Compose network.
+- **YouTube cookies are a credential.** They are only as safe as this app's auth,
+  which is none. Keep it on loopback.
+
+Not intended for multi-tenant or public deployment.

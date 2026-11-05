@@ -17,7 +17,13 @@ class SearchResultSchema(BaseModel):
 
 
 class SongCreate(BaseModel):
-    youtube_video_id: str
+    # YouTube video ids are exactly 11 characters from this alphabet. This
+    # is not cosmetic: the id is interpolated into the download URL and
+    # into storage keys (`audio/{id}.wav`, `stems/{id}/...`), so an
+    # unconstrained string is an unbounded download trigger and a path
+    # -shaping primitive. Local imports manage their own `local-<hash>`
+    # keys and never go through this schema.
+    youtube_video_id: str = Field(pattern=r"^[A-Za-z0-9_-]{11}$")
     title: str
     artist: str | None = None
     duration_seconds: float = Field(ge=0)

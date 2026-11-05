@@ -1,3 +1,7 @@
-from app.services.youtube.service import SearchResult, YouTubeService
+from app.services.youtube.service import (
+    SearchQueryRejected,
+    SearchResult,
+    YouTubeService,
+)
 
-__all__ = ["SearchResult", "YouTubeService"]
+__all__ = ["SearchQueryRejected", "SearchResult", "YouTubeService"]

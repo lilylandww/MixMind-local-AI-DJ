@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,10 @@ import yt_dlp
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Anything with a URL scheme, or a bare `www.` host. Deliberately does not
+# try to match bare domains: "Mr. Brightside" is a song, not a hostname.
+_URL_LIKE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://|^www\.", re.IGNORECASE)
 
 
 def _cookies_opt() -> dict[str, Any]:
@@ -45,6 +50,16 @@ class YouTubeDownloadError(RuntimeError):
     pass
 
 
+class SearchQueryRejected(ValueError):
+    """The query isn't a search term (it looks like a URL).
+
+    Raised instead of handing it to yt-dlp: `extract_info` fetches a URL as
+    itself, so on an unauthenticated host the search box doubles as an SSRF
+    primitive pointed at the cloud metadata address and the compose
+    network. Surfaced as HTTP 400.
+    """
+
+
 class YouTubeService:
     """Thin wrapper around yt-dlp for search + best-audio download.
 
@@ -52,16 +67,27 @@ class YouTubeService:
     """
 
     def search(self, query: str, limit: int = 10) -> list[SearchResult]:
+        term = (query or "").strip()
+        if not term:
+            raise SearchQueryRejected("empty search query")
+        if _URL_LIKE.search(term):
+            raise SearchQueryRejected(
+                "search takes keywords, not URLs"
+            )
+
+        # Always address the search extractor explicitly. `default_search`
+        # only kicks in when yt-dlp does *not* recognise the input as a URL,
+        # so relying on it leaves the fetch-this-URL branch reachable.
+        search_term = f"ytsearch{limit}:{term}"
         opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
             "extract_flat": "in_playlist",
-            "default_search": f"ytsearch{limit}",
             **_cookies_opt(),
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(query, download=False)
+            info = ydl.extract_info(search_term, download=False)
 
         entries = (info or {}).get("entries") or []
         results: list[SearchResult] = []

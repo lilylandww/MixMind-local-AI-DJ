@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.services.youtube import SearchResult, YouTubeService
-from app.services.youtube.service import YouTubeDownloadError
+from app.services.youtube.service import SearchQueryRejected, YouTubeDownloadError
 
 
 def _fake_ydl(extract_return: dict | None = None, download_side_effect=None):
@@ -109,3 +109,49 @@ def test_download_wraps_ytdlp_errors(tmp_path: Path):
     with patch("app.services.youtube.service.yt_dlp.YoutubeDL", factory):
         with pytest.raises(YouTubeDownloadError, match="network exploded"):
             YouTubeService().download("abc", tmp_path / "x.wav")
+
+
+def test_search_addresses_the_search_extractor_explicitly():
+    """Relying on `default_search` leaves the fetch-this-URL branch open:
+    yt-dlp only consults it when the input is *not* recognised as a URL."""
+    factory, instance = _fake_ydl(extract_return={"entries": []})
+    with patch("app.services.youtube.service.yt_dlp.YoutubeDL", factory):
+        YouTubeService().search("daft punk", limit=3)
+    instance.extract_info.assert_called_once_with(
+        "ytsearch3:daft punk", download=False
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "https://example.com/x",
+        "http://169.254.169.254/latest/meta-data/",
+        "file:///etc/passwd",
+        "gopher://127.0.0.1:6379/_INFO",
+        "www.example.com",
+        "HTTP://Example.COM",
+    ],
+)
+def test_search_rejects_urls(query: str):
+    """A URL in the search box would be fetched as itself — SSRF aimed at
+    the metadata service and the compose network."""
+    factory, instance = _fake_ydl(extract_return={"entries": []})
+    with patch("app.services.youtube.service.yt_dlp.YoutubeDL", factory):
+        with pytest.raises(SearchQueryRejected):
+            YouTubeService().search(query)
+    instance.extract_info.assert_not_called()
+
+
+def test_search_rejects_empty_query():
+    with pytest.raises(SearchQueryRejected):
+        YouTubeService().search("   ")
+
+
+def test_search_allows_titles_that_contain_dots():
+    # "Mr. Brightside" is a song, not a hostname — the URL check must not
+    # be a naive domain heuristic.
+    factory, instance = _fake_ydl(extract_return={"entries": []})
+    with patch("app.services.youtube.service.yt_dlp.YoutubeDL", factory):
+        YouTubeService().search("Mr. Brightside")
+    instance.extract_info.assert_called_once()

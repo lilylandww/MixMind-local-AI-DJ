@@ -35,7 +35,7 @@ def teardown_function():
 
 def _payload(**overrides):
     base = {
-        "youtube_video_id": "abc123",
+        "youtube_video_id": "abc123XYZ_-",
         "title": "A Song",
         "artist": "An Artist",
         "duration_seconds": 200.0,
@@ -52,7 +52,7 @@ def test_create_song_persists_and_enqueues(db_session: Session):
         r = client.post("/api/songs", json=_payload())
     assert r.status_code == 201
     body = r.json()
-    assert body["youtube_video_id"] == "abc123"
+    assert body["youtube_video_id"] == "abc123XYZ_-"
     assert body["status"] == "pending"
     dispatch.assert_called_once_with(args=[body["id"]], priority=PRI_DOWNLOAD)
 
@@ -112,7 +112,7 @@ def test_list_songs(db_session: Session):
     client = _client(db_session)
     with patch("app.api.songs.download_song.apply_async"):
         client.post("/api/songs", json=_payload())
-        client.post("/api/songs", json=_payload(youtube_video_id="def", title="Two"))
+        client.post("/api/songs", json=_payload(youtube_video_id="def456GHIjk", title="Two"))
     r = client.get("/api/songs")
     assert r.status_code == 200
     titles = [s["title"] for s in r.json()]

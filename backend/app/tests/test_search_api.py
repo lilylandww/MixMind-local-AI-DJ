@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.api.deps import get_youtube_service
 from app.main import app
-from app.services.youtube import SearchResult
+from app.services.youtube import SearchResult, YouTubeService
 
 
 def _override(results):
@@ -61,3 +61,15 @@ def test_search_endpoint_forwards_limit():
     client = TestClient(app)
     client.get("/api/search", params={"q": "x", "limit": 7})
     svc.search.assert_called_once_with("x", limit=7)
+
+
+def test_search_endpoint_rejects_urls():
+    """A URL used to reach yt-dlp, which fetches it as itself — an SSRF
+    primitive pointed at the cloud metadata address and the compose
+    network. Uses the real service so the guard itself is exercised."""
+    app.dependency_overrides[get_youtube_service] = lambda: YouTubeService()
+    client = TestClient(app)
+    r = client.get("/api/search", params={"q": "http://169.254.169.254/"})
+    assert r.status_code == 400
+    assert "URL" in r.json()["detail"]
+
