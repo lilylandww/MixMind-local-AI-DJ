@@ -43,6 +43,78 @@ CLAIMABLE_STATUSES = (
     QueueRenderStatus.failed,
 )
 
+# Frames handed to ffmpeg per write. 2**20 stereo frames is ~24 s of audio
+# and ~8 MB of float32 — small enough that the encode never needs a second
+# full-size copy of the mix.
+PCM_BLOCK_FRAMES = 1 << 20
+
+
+def _iter_pcm_blocks(
+    audio: np.ndarray, block_frames: int = PCM_BLOCK_FRAMES
+):
+    """Yield the mix as little-endian float32 PCM, one block at a time.
+
+    Deliberately a generator: calling ``audio.tobytes()`` on a 2 h 44.1 kHz
+    stereo mix allocates ~2.5 GB, which is exactly the copy this avoids.
+    """
+    if audio.ndim == 1:
+        audio = audio[:, None]
+    for start in range(0, audio.shape[0], block_frames):
+        yield np.ascontiguousarray(audio[start : start + block_frames]).tobytes()
+
+
+def _encode_m4a(
+    audio: np.ndarray, sr: int, out_path: Path, log_path: Path
+) -> None:
+    """Encode float32 PCM to AAC by streaming it into ffmpeg's stdin.
+
+    The previous implementation wrote the whole mix to a PCM16 WAV (~1.3 GB
+    for a 2 h set) and had ffmpeg read it back — a full extra write *and*
+    read, plus a file big enough to matter on a small disk. Piping removes
+    that intermediate entirely.
+
+    stderr is redirected to a file rather than a pipe: ffmpeg can emit more
+    than a pipe buffer while we are still writing stdin, which would
+    deadlock the encode.
+    """
+    channels = audio.shape[1] if audio.ndim > 1 else 1
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "f32le", "-ar", str(sr), "-ac", str(channels),
+        "-i", "pipe:0",
+        "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
+        str(out_path),
+    ]
+
+    with open(log_path, "wb") as err:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=err)
+        stdin = proc.stdin
+        if stdin is None:  # pragma: no cover - PIPE guarantees a handle
+            proc.kill()
+            raise RuntimeError("ffmpeg stdin unavailable")
+        try:
+            for block in _iter_pcm_blocks(audio):
+                stdin.write(block)
+        except (BrokenPipeError, ValueError):
+            # ffmpeg exited early; the return code and log explain why.
+            pass
+        finally:
+            try:
+                stdin.close()
+            except (BrokenPipeError, ValueError):
+                pass
+        returncode = proc.wait()
+
+    if returncode != 0:
+        detail = Path(log_path).read_text(errors="replace").strip()
+        logger.error(
+            "stitch_queue: ffmpeg AAC encode failed for %s: %s",
+            out_path, detail,
+        )
+        raise RuntimeError(
+            f"ffmpeg AAC encode failed (exit {returncode}): {detail[:500]}"
+        )
+
 
 def _get_mix0_sample(
     plan_json: list[dict],
@@ -329,6 +401,7 @@ def stitch_queue(queue_id: str) -> str | None:
 
     # Now stitch!
     sr = 44100
+    key = f"queue_mixes/{queue_id}.m4a"
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         
@@ -454,6 +527,11 @@ def stitch_queue(queue_id: str) -> str | None:
 
         final_audio = np.concatenate(stitched)
 
+        # Free the per-render buffers: `np.concatenate` copied them into
+        # `final_audio`, so keeping both alive doubles the peak. Nothing
+        # below touches `audios` or `stitched` again.
+        del audios, stitched
+
         # Phase 10: build the player timeline from the accumulated offsets.
         # Best-effort — a timeline glitch must never fail an otherwise-good
         # mix render.
@@ -496,34 +574,14 @@ def stitch_queue(queue_id: str) -> str | None:
             if host_events and timeline is not None:
                 timeline["host"] = host_events
 
-        wav_dest = tmp / "final.wav"
         out_dest = tmp / "final.m4a"
-        sf.write(str(wav_dest), final_audio, sr, format="WAV", subtype="PCM_16")
+        _encode_m4a(final_audio, sr, out_dest, tmp / "ffmpeg.log")
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(wav_dest),
-            "-c:a", "aac",
-            "-b:a", "256k",
-            "-movflags", "+faststart",
-            str(out_dest)
-        ]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as exc:
-            # CalledProcessError's message omits stderr — log it or the
-            # actual encoder failure is invisible.
-            logger.error(
-                "stitch_queue: ffmpeg AAC encode failed for %s: %s",
-                queue_id, (exc.stderr or b"").decode(errors="replace").strip(),
-            )
-            raise
-
-        with open(out_dest, "rb") as f:
-            audio_bytes = f.read()
-
-    key = f"queue_mixes/{queue_id}.m4a"
-    asyncio.run(storage.write(key, audio_bytes))
+        # The mix is a finished M4A on disk now, so drop the ~2.5 GB
+        # in-memory array before uploading. `upload_file` streams from the
+        # path, so the encoded file is never read back into memory either.
+        del final_audio
+        asyncio.run(storage.upload_file(out_dest, key))
 
     with SessionLocal() as db:
         row = db.get(QueueRender, render_row_id)
