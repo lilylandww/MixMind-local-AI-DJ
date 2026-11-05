@@ -70,6 +70,11 @@ logs/
 *.sqlite3
 *.db
 
+# Agent session logs — a local work journal, deliberately not published.
+# They describe internal reasoning and security findings, so they stay on
+# the machine that ran the session.
+docs/agent-sessions/
+
 # Deployment artifacts (built by deploy script, never committed)
 *.tar.gz
 *.zip
