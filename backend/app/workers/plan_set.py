@@ -33,11 +33,20 @@ from app.workers import celery_app
 logger = logging.getLogger(__name__)
 
 
-def _peak_energy_position(energy_curve: list[float]) -> float | None:
+def _peak_energy_position(
+    energy_curve: list[float], fraction: float = 1.0
+) -> float | None:
+    """Peak position as 0..1 of the part of the song the mix will play.
+
+    In a capped mode the second half is mixed out, so a late peak is
+    irrelevant (and suggesting a style around it would be misleading).
+    """
     if not energy_curve:
         return None
-    peak_idx = max(range(len(energy_curve)), key=lambda i: energy_curve[i])
-    return round(peak_idx / max(1, len(energy_curve) - 1), 2)
+    n = max(1, int(len(energy_curve) * fraction))
+    curve = energy_curve[:n]
+    peak_idx = max(range(len(curve)), key=lambda i: curve[i])
+    return round(peak_idx / max(1, len(curve) - 1), 2)
 
 
 @celery_app.task(name="app.workers.plan_set.plan_set")
@@ -119,6 +128,13 @@ def _plan_set_inner(queue_uuid: uuid.UUID) -> str | None:
         queue_occasion = queue.occasion
         queue_vibe_note = queue.vibe_note
         queue_arc_template = queue.arc_template
+        queue_song_length = queue.song_length
+
+        from app.services.mixer.candidates import SONG_LENGTH_FRACTIONS
+
+        out_fraction = SONG_LENGTH_FRACTIONS.get(
+            queue_song_length or "full", 1.0
+        )
 
         songs_payload: list[dict] = []
         for idx, item in enumerate(items):
@@ -139,7 +155,7 @@ def _plan_set_inner(queue_uuid: uuid.UUID) -> str | None:
                 "camelot_key": analysis.camelot_key,
                 "duration": round(song.duration_seconds or 0.0, 1),
                 "peak_energy_position": _peak_energy_position(
-                    list(analysis.energy_curve or [])
+                    list(analysis.energy_curve or []), out_fraction
                 ),
             })
 
@@ -162,6 +178,12 @@ def _plan_set_inner(queue_uuid: uuid.UUID) -> str | None:
     )
 
     set_context = occasion_context(queue_occasion, queue_vibe_note)
+    if out_fraction < 1.0:
+        set_context["track_length"] = (
+            "SHORT-FORMAT SET: each track is mixed out around its midpoint. "
+            "Plan for quick, decisive handovers with early high-energy "
+            "entries; don't build the arc around a late-song peak."
+        )
     try:
         from app.services.feedback.summary import feedback_context
 

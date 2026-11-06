@@ -129,12 +129,49 @@ def test_queue_song_length_patch(client):
         assert resp.status_code == 200, resp.text
         assert resp.json()["song_length"] == "half"
 
+        # "full" and NULL are the same mode; store one canonical form.
+        resp = client.patch(f"/api/queues/{qid}", json={"song_length": "full"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["song_length"] is None
+
         assert client.patch(
             f"/api/queues/{qid}", json={"song_length": "quarter"}
         ).status_code == 422
 
         resp = client.patch(f"/api/queues/{qid}", json={"song_length": None})
         assert resp.json()["song_length"] is None
+    finally:
+        with SessionLocal() as db:
+            row = db.get(Queue, _uuid.UUID(qid))
+            if row is not None:
+                db.delete(row)
+            db.commit()
+
+
+def test_queue_song_length_rejects_legacy_planner(client):
+    """Half mode needs v2's capped candidate contract; the legacy
+    free-form prompt can't enforce it, so reject the setting up front."""
+    import uuid as _uuid
+    from unittest.mock import patch
+
+    from app.core.db import SessionLocal
+    from app.models import Queue
+
+    with SessionLocal() as db:
+        q = Queue(locked=False)
+        db.add(q)
+        db.commit()
+        qid = str(q.id)
+    try:
+        with (
+            patch("app.api.queues.settings.use_llm_planner", True),
+            patch("app.api.queues.settings.planner_version", "legacy"),
+        ):
+            resp = client.patch(
+                f"/api/queues/{qid}", json={"song_length": "half"}
+            )
+        assert resp.status_code == 422
+        assert "PLANNER_VERSION" in resp.text
     finally:
         with SessionLocal() as db:
             row = db.get(Queue, _uuid.UUID(qid))

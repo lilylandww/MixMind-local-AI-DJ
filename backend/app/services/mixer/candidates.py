@@ -45,6 +45,14 @@ SONG_LENGTH_FRACTIONS = {"full": 1.0, "half": 0.5}
 # ceiling alone leaves short/coarse section lists offering "mix out at
 # 0:00" as a menu entry; no DJ leaves a track in its first bars.
 MIN_OUT_FRACTION = 0.2
+# Half mode reserves room after B's entry for the incoming blend and the
+# B-side tempo ramp, plus a small safety gap. The cap uses the EARLIEST
+# OUT the next pair can choose, so it holds no matter which OUT that pair
+# picks. Kept here (not in planner_v2) so the stitch guard and tests can
+# share the same numbers.
+HALF_MIN_BLEND_BARS = 2
+HALF_MIN_RAMP_BARS = 4
+HALF_SEAM_GAP_SECONDS = 1.0
 # A vocal-safe entry must stay clear of vocals for this many bars after
 # the candidate point for a hard cut to land cleanly.
 VOCAL_SAFE_LOOKAHEAD_BARS = 2.0
@@ -368,13 +376,22 @@ def _phrase_tag(t: float, grid: list[float]) -> str:
     return " (phrase-aligned)" if any(abs(t - g) < 1e-6 for g in grid) else ""
 
 
-def _dedup_and_cap(cands: list[SeamCandidate]) -> list[SeamCandidate]:
+def _dedup_and_cap(
+    cands: list[SeamCandidate], *, keep_last: bool = False
+) -> list[SeamCandidate]:
     cands = sorted(cands, key=lambda c: c.time)
     kept: list[SeamCandidate] = []
     for c in cands:
         if kept and abs(c.time - kept[-1].time) < DEDUP_SECONDS:
             continue
         kept.append(c)
+    if len(kept) <= MAX_CANDIDATES:
+        return kept
+    if keep_last:
+        # The "latest possible" fallback is appended last and is the whole
+        # point of the capped modes; don't let a long section list crowd it
+        # out of the menu.
+        return kept[: MAX_CANDIDATES - 1] + [kept[-1]]
     return kept[:MAX_CANDIDATES]
 
 
@@ -407,10 +424,12 @@ def build_out_candidates(
 
     `max_out_fraction` caps how far into the track the mix may linger.
     1.0 (the default) plays A out. 0.5 mixes out around the midpoint so a
-    set moves at the pace a DJ works a short slot — the exit is still
-    chosen from section boundaries, but "late song" is re-derived relative
-    to the cap (the last three sections of the *kept* part) so it lands
-    after a chorus rather than at an arbitrary bar.
+    set moves at the pace a DJ works a short slot — the exit is re-derived
+    from the *kept* part (the last three sections under the cap), so it
+    lands on a section/phrase boundary when one exists. The "latest
+    possible" candidate is the last phrase boundary or downbeat at/before
+    the cap, so a capped mode always leaves a usable menu even when the
+    cap falls between bars.
     """
     hard_ceiling = max_seam_time(a.duration, a.bpm, a.time_signature)
     if hard_ceiling <= 0:
@@ -492,21 +511,28 @@ def build_out_candidates(
 
     # Always offer "as late as the headroom allows" — the v1 default.
     if max_out_fraction < 1.0:
-        # Under a cap, snapping *back* to the previous phrase can land far
-        # short of it (a 16-bar boundary often overshoots the cap), which
-        # would leave the shortened menu ending well before "half". Snap
-        # forward instead, falling back to a downbeat at the cap.
-        late = _snap_to_phrase(ceiling, grid, a.downbeats, ceiling)
+        # Under a cap, the phrase grid's previous boundary can be far short
+        # of it (e.g. 94 s when the cap is 120 s), while the next boundary
+        # often overshoots. Use the later of the two safe anchors: the last
+        # phrase boundary at/before the cap, or the last downbeat at/before
+        # it. The latter always exists (unless the song is shorter than one
+        # bar), so a non-bar-aligned duration can't produce an empty menu.
+        late = max(
+            _snap_to_phrase_at_or_before(ceiling, grid, a.downbeats),
+            _snap_to_downbeat_at_or_before(ceiling, a.downbeats),
+        )
+        late_desc = "latest possible out point (capped)"
     else:
         late = _snap_to_phrase_at_or_before(ceiling, grid, a.downbeats)
+        late_desc = "latest possible out point"
     if late <= ceiling:
         raw.append(_out_candidate(
             late,
-            "latest possible out point" + _phrase_tag(late, grid),
+            late_desc + _phrase_tag(late, grid),
             _energy_at(sections, late),
         ))
 
-    return _reid(_dedup_and_cap(raw), "A")
+    return _reid(_dedup_and_cap(raw, keep_last=True), "A")
 
 
 def build_in_candidates(
@@ -599,6 +625,41 @@ def _energy_at(enriched_sections: list[dict], t: float) -> float:
     return enriched_sections[-1]["energy"] if enriched_sections else 0.5
 
 
+def cap_in_candidates_for_out(
+    in_candidates: list[SeamCandidate],
+    next_out_time: float | None,
+    sec_per_bar_b: float,
+    *,
+    tempo_ratio: float = 1.0,
+    needs_ramp: bool = False,
+    min_blend_bars: int = HALF_MIN_BLEND_BARS,
+    min_ramp_bars: int = HALF_MIN_RAMP_BARS,
+    gap_seconds: float = HALF_SEAM_GAP_SECONDS,
+) -> list[SeamCandidate]:
+    """Keep entries that leave room for the incoming blend and B-side
+    tempo ramp before the *earliest* OUT the next pair can choose.
+
+    `next_out_time` must be the earliest candidate in song B's own OUT
+    menu, not the cap. The next pair can legally pick any entry in that
+    menu, so clearing the earliest one is what makes the constraint hold
+    for every choice — no cross-pair state or ordering required.
+
+    If nothing fits, keep the earliest entry. The expander then shortens
+    the blend/ramp to the available room, and the stitch refuses any
+    residual overlap instead of emitting a broken mix.
+    """
+    if not in_candidates or next_out_time is None:
+        return list(in_candidates)
+    reserve = (
+        min_blend_bars * sec_per_bar_b * tempo_ratio
+        + (min_ramp_bars * sec_per_bar_b if needs_ramp else 0.0)
+        + gap_seconds
+    )
+    max_in = next_out_time - reserve
+    kept = [c for c in in_candidates if c.time <= max_in]
+    return kept or [in_candidates[0]]
+
+
 def build_pair_candidates(
     a: AnalysisBundle,
     b: AnalysisBundle,
@@ -608,10 +669,23 @@ def build_pair_candidates(
     b_safe_regions: list[dict],
     *,
     out_fraction: float = 1.0,
+    next_out_time: float | None = None,
+    tempo_ratio: float = 1.0,
+    needs_ramp: bool = False,
 ) -> PairCandidates:
+    in_candidates = build_in_candidates(b, b_energy_curve, b_safe_regions)
+    if out_fraction < 1.0 and next_out_time is not None:
+        spb_b = (60.0 / b.bpm) * b.time_signature if b.bpm else 0.0
+        in_candidates = cap_in_candidates_for_out(
+            in_candidates,
+            next_out_time,
+            spb_b,
+            tempo_ratio=tempo_ratio,
+            needs_ramp=needs_ramp,
+        )
     return PairCandidates(
         out_candidates=build_out_candidates(
             a, a_energy_curve, a_safe_regions, max_out_fraction=out_fraction
         ),
-        in_candidates=build_in_candidates(b, b_energy_curve, b_safe_regions),
+        in_candidates=in_candidates,
     )

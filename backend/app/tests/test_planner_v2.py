@@ -1057,3 +1057,77 @@ def test_planner_honors_pinned_vinyl_stop():
     ))
     assert outcome.style == "vinyl_stop"   # the user's call, always
     validate_plan(outcome.plan)
+
+
+# ---------------------------------------------------- capped-mode seam budget
+
+def _four_section_bundle(bpm: float = 120.0) -> AnalysisBundle:
+    duration = 240.0
+    spb = (60.0 / bpm) * 4
+    return AnalysisBundle(
+        bpm=bpm, key="C", camelot_key="8B", time_signature=4,
+        beat_grid=[i * (spb / 4) for i in range(int(duration / (spb / 4)))],
+        downbeats=[round(i * spb, 4) for i in range(int(duration / spb) + 2)],
+        sections=[
+            {"start": 0.0, "end": 30.0, "label": "intro"},
+            {"start": 30.0, "end": 90.0, "label": "verse"},
+            {"start": 90.0, "end": 150.0, "label": "chorus"},
+            {"start": 150.0, "end": 240.0, "label": "outro"},
+        ],
+        duration=duration,
+    )
+
+
+def _four_section_energy() -> list[float]:
+    return [0.3] * 30 + [0.5] * 60 + [0.95] * 60 + [0.3] * 90
+
+
+def test_planner_v2_capped_mode_caps_the_entry_before_the_next_out():
+    """B's next pair can mix out at 90 s. Entering B at 90 s (the chorus)
+    would leave no room for the incoming blend/ramp, so the planner must
+    only offer the post-intro entry."""
+    a = SongMeta(
+        "A", None, _four_section_bundle(), _four_section_energy(), FULL_SAFE
+    )
+    b = SongMeta(
+        "B", None, _four_section_bundle(), _four_section_energy(), FULL_SAFE
+    )
+    provider = StubProvider(response={
+        "out": "A1", "in": "B1", "style": "smooth_blend", "duration_bars": 8,
+    })
+    outcome = asyncio.run(build_plan_v2(
+        provider, a, b, out_fraction=0.5, b_is_closer=False,
+    ))
+    window = next(
+        c for c in outcome.plan if c["tool"] == "set_transition_window"
+    )
+    assert window["to_song_time_start"] <= 30.0 + 1e-6
+    assert window["from_song_time_start"] <= 120.0
+    validate_plan(outcome.plan)
+
+
+def test_planner_v2_capped_mode_shortens_the_b_ramp_before_the_next_out():
+    """The stitch waits for B's tempo ramp, not just the crossfade. With a
+    1:1 BPM gap the ramp must still end before B's next OUT (90 s)."""
+    a = SongMeta(
+        "A", None, _four_section_bundle(120.0),
+        _four_section_energy(), FULL_SAFE,
+    )
+    b = SongMeta(
+        "B", None, _four_section_bundle(125.0),
+        _four_section_energy(), FULL_SAFE,
+    )
+    provider = StubProvider(response={
+        "out": "A1", "in": "B1", "style": "smooth_blend", "duration_bars": 8,
+    })
+    outcome = asyncio.run(build_plan_v2(
+        provider, a, b, out_fraction=0.5, b_is_closer=False,
+    ))
+    ramp = next(
+        (c for c in outcome.plan
+         if c["tool"] == "set_tempo_ramp" and c.get("song") != "A"),
+        None,
+    )
+    assert ramp is not None
+    assert ramp["end_time"] <= 90.0
+    validate_plan(outcome.plan)

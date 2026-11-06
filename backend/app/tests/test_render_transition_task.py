@@ -24,6 +24,8 @@ from app.models import (
     Stems,
     StemsStatus,
 )
+from app.services.mixer.planner_v2 import PlanOutcome
+from app.services.mixer.qa import QAReport
 from app.services.mixer.types import RenderedTransition
 
 
@@ -728,14 +730,12 @@ def test_render_transition_rejects_llm_permanent_pitch_shift(pair_with_plan):
 
 # ---------- render QA + auto-reroll ----------
 
-def _qa_report(verdict: str) -> "QAReport":
-    from app.services.mixer.qa import QAReport
+def _qa_report(verdict: str) -> QAReport:
     flags = [] if verdict == "pass" else [f"{verdict}:clipping"]
     return QAReport(verdict=verdict, metrics={"clip_ratio": 0.5}, flags=flags)
 
 
-def _outcome(style: str) -> "PlanOutcome":
-    from app.services.mixer.planner_v2 import PlanOutcome
+def _outcome(style: str) -> PlanOutcome:
     return PlanOutcome(
         plan=_valid_plan(), source="llm_v2", style=style, rationale="r"
     )
@@ -817,3 +817,91 @@ def test_render_qa_fail_with_style_pin_ships_without_retry(pair_with_plan):
         assert row.status == MixPlanStatus.ready
         assert row.qa_verdict == "fail"         # shipped, but honestly labeled
         assert row.reroll_nonce == 0
+
+
+def test_render_transition_passes_capped_fraction_to_v2(pair_with_plan):
+    with SessionLocal() as db:
+        q = db.get(Queue, uuid.UUID(pair_with_plan["queue_id"]))
+        q.song_length = "half"
+        db.commit()
+
+    storage = AsyncMock()
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+
+    outcome = PlanOutcome(
+        plan=_valid_plan(), source="llm_v2", style=None, rationale=None
+    )
+    with (
+        patch("app.workers.render_transition.render", return_value=_patched_render()),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch(
+            "app.workers.render_transition.build_plan_v2",
+            new=AsyncMock(return_value=outcome),
+        ) as plan_mock,
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "v2"),
+    ):
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    kwargs = plan_mock.call_args.kwargs
+    assert kwargs["out_fraction"] == 0.5
+    # B is the last song, so the entry must not be constrained by a
+    # non-existent next exit.
+    assert kwargs["b_is_closer"] is True
+
+
+def test_render_transition_deterministic_honors_track_length(pair_with_plan):
+    with SessionLocal() as db:
+        q = db.get(Queue, uuid.UUID(pair_with_plan["queue_id"]))
+        q.song_length = "half"
+        db.commit()
+
+    storage = AsyncMock()
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+
+    with (
+        patch("app.workers.render_transition.render", return_value=_patched_render()),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch(
+            "app.workers.render_transition.build_pair_plan",
+            return_value=_valid_plan(),
+        ) as pair_plan_mock,
+        patch("app.workers.render_transition.settings.use_llm_planner", False),
+    ):
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    assert pair_plan_mock.call_args.kwargs["max_out_fraction"] == 0.5
+
+
+def test_render_transition_rejects_capped_mode_on_legacy_planner(pair_with_plan):
+    with SessionLocal() as db:
+        q = db.get(Queue, uuid.UUID(pair_with_plan["queue_id"]))
+        q.song_length = "half"
+        db.commit()
+
+    storage = AsyncMock()
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+
+    with (
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "legacy"),
+    ):
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result is None
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        assert row.status == MixPlanStatus.failed
+        assert "PLANNER_VERSION" in (row.error_text or "")

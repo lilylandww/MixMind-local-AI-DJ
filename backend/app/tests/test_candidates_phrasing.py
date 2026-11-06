@@ -10,6 +10,7 @@ from __future__ import annotations
 from app.services.mixer.candidates import (
     build_in_candidates,
     build_out_candidates,
+    cap_in_candidates_for_out,
     max_seam_time,
     phrase_grid,
     _snap_to_phrase,
@@ -109,9 +110,21 @@ def test_out_candidates_capped_to_half_the_track():
     cands = build_out_candidates(b, [0.5] * int(DUR), [], max_out_fraction=0.5)
     assert cands
     assert all(c.time <= DUR * 0.5 for c in cands)
-    # The "latest allowed" exit survives, so the LLM can always choose to
-    # play as much of the track as the mode permits.
-    assert max(c.time for c in cands) > DUR * 0.5 - 40
+    # The "latest allowed" exit survives and is close to the cap. This is
+    # the regression that the earlier threshold (> 80 s) missed: snapping
+    # back to the previous phrase produced 94 s and passed.
+    assert max(c.time for c in cands) >= DUR * 0.5 - 2
+
+
+def test_capped_out_candidates_survive_non_bar_aligned_durations():
+    # 4:01 with a coarse intro/body/outro: the cap (120.5 s) isn't a bar
+    # boundary. Snapping forward used to overshoot and drop the only
+    # candidate, producing an empty menu and a silent full-length fallback.
+    b = _bundle(duration=241.0)
+    cands = build_out_candidates(b, [0.5] * 241, [], max_out_fraction=0.5)
+    assert cands
+    assert max(c.time for c in cands) >= 241.0 * 0.5 - 2
+    assert all(c.time <= 241.0 * 0.5 for c in cands)
 
 
 def test_capped_out_candidates_respect_a_musical_floor():
@@ -132,7 +145,35 @@ def test_capped_out_candidates_prefer_late_section_boundaries():
     ]
     b = _bundle(sections=sections)
     cands = build_out_candidates(b, [0.5] * int(DUR), [], max_out_fraction=0.5)
-    # 90 s is the last section start under the 120 s cap, so the exit still
-    # lands on a boundary rather than an arbitrary bar.
+    # 90 s is the last section start under the 120 s cap, so it stays in
+    # the menu. The capped "latest possible" point at 120 s also survives:
+    # that is the exit that makes the mode actually ~half.
     assert any(c.time == 90.0 for c in cands)
-    assert all(c.time <= 120.0 for c in cands)
+    assert any(c.time == 120.0 for c in cands)
+    assert max(c.time for c in cands) == 120.0
+
+
+def test_cap_in_candidates_clears_the_next_out():
+    b = _bundle(sections=[
+        {"start": 0.0, "end": 30.0, "label": "intro"},
+        {"start": 30.0, "end": 90.0, "label": "verse"},
+        {"start": 90.0, "end": 150.0, "label": "chorus"},
+        {"start": 150.0, "end": 240.0, "label": "outro"},
+    ])
+    energy = [0.3] * 30 + [0.5] * 60 + [0.95] * 60 + [0.3] * 90
+    in_cands = build_in_candidates(b, energy, [])
+    assert any(c.time == 90.0 for c in in_cands)
+
+    # The next pair can exit at 90 s, so a 90 s entry plus any blend would
+    # overlap; only the post-intro entry survives.
+    kept = cap_in_candidates_for_out(
+        in_cands, 90.0, 2.0, needs_ramp=True
+    )
+    assert [c.time for c in kept] == [30.0]
+
+    # If the next pair's earliest exit is the 120 s cap, the 90 s entry
+    # is still legal and should remain available.
+    kept = cap_in_candidates_for_out(
+        in_cands, 120.0, 2.0, needs_ramp=True
+    )
+    assert [c.time for c in kept] == [30.0, 90.0]

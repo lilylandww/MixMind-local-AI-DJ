@@ -216,7 +216,9 @@ export type ContextOptions = {
   arcs: { id: string; label: string; description: string }[];
   host_frequencies: string[];
   host_personas: string[];
-  song_lengths: { id: string; label: string }[];
+  /** Optional so a new frontend survives an older backend during a
+   * rolling deploy / cached API response. */
+  song_lengths?: { id: string; label: string }[];
 };
 
 export type MixPlanStatus = "pending" | "rendering" | "ready" | "failed";
@@ -276,6 +278,29 @@ export type VocalSafeRegion = {
 
 export type VocalSafeRegionsResponse = {
   regions: VocalSafeRegion[];
+};
+
+export type AlignedLyricWord = {
+  word: string;
+  start: number;
+  end: number;
+  confidence: number;
+  source: "whisper_match" | "whisper_substitution" | "interpolated";
+};
+
+export type Lyrics = {
+  song_id: string;
+  genius_id: number | null;
+  text: string | null;
+  fetch_status: "not_attempted" | "success" | "not_found" | "error";
+  aligned_words: AlignedLyricWord[] | null;
+  alignment_status:
+    | "not_attempted"
+    | "success"
+    | "whisper_only"
+    | "low_quality"
+    | "error";
+  alignment_quality: number | null;
 };
 
 export type QueueRenderStatus = "pending" | "rendering" | "ready" | "failed";
@@ -368,7 +393,7 @@ export const api = {
   getTranscription: (id: string) =>
     request<Transcription>(`/api/songs/${id}/transcription`),
   getLyrics: (id: string) =>
-    request<any>(`/api/songs/${id}/lyrics`),
+    request<Lyrics>(`/api/songs/${id}/lyrics`),
   getVocalSafeRegions: (id: string) =>
     request<VocalSafeRegionsResponse>(`/api/songs/${id}/vocal_safe_regions`),
 

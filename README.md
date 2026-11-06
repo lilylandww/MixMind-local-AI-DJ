@@ -219,7 +219,7 @@ docker compose down -v   # optional: fully wipe past data from the containers
 ## Using the app
 
 1. **Get music in.** Search YouTube and add tracks, or use *Import from disk* to drag in files (drop a `.lrc` next to a track and it's used as its lyrics), or import a whole server folder. Add a few and **drag to reorder**.
-2. **Set the shape of the set.** The **gig** panel picks an occasion, an energy arc, and a **track length**: `Full tracks` plays each song out, `Half tracks` mixes out around the midpoint the way a DJ works a short slot. Exits stay on section boundaries, so "half" leaves after a chorus rather than mid‑verse — and the closing track always plays out.
+2. **Set the shape of the set.** The **gig** panel picks an occasion, an energy arc, and a **track length**: `Full tracks` plays each song out, `Half tracks` mixes out at the last section/phrase boundary at or before the midpoint (falling back to the last downbeat under the cap). Exits are an **upper bound** — a track whose last usable boundary is earlier will mix out earlier — and the incoming blend plus tempo ramp are kept clear of the next exit. The closing track always plays out.
 3. Click **Done** to lock the queue. The **Processing** view shows each song moving through the pipeline and each transition rendering; failures surface inline with a **Retry**.
 4. When the continuous mix is ready it advances to the **Player**, which streams the stitched set and shows the active transition. You can re‑roll any transition, download the mix as an M4A, or switch to per‑song "Queue Mode."
 5. Per‑song detail — BPM/key, sections, stems, the transcription and how its lyrics aligned — is under `/songs/<id>/debug`, which is the place to look when a cut lands somewhere unexpected.

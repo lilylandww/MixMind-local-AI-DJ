@@ -36,8 +36,9 @@ class QueueRead(BaseModel):
 
 
 class QueueContextUpdate(BaseModel):
-    """PATCH /api/queues/{id} — occasion / vibe / arc / tease settings.
-    All optional; only provided fields change."""
+    """PATCH /api/queues/{id} — occasion / vibe / arc / tease / track-
+    length settings. All optional; only provided fields change.
+    `song_length` accepts "full" / "half"; "full" is stored as NULL."""
 
     occasion: str | None = None
     vibe_note: str | None = None
