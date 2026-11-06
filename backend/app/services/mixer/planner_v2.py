@@ -194,6 +194,7 @@ async def build_plan_v2(
     tempo_meet: bool = True,
     extra_context: dict | None = None,
     tease_enabled: bool = False,
+    out_fraction: float = 1.0,
 ) -> PlanOutcome:
     # Lazy import keeps the mixer package importable without the llm
     # package's heavy provider dependencies (pure unit tests, tooling).
@@ -212,6 +213,7 @@ async def build_plan_v2(
         a.bundle, b.bundle,
         a.energy_curve, b.energy_curve,
         a.safe_regions, b.safe_regions,
+        out_fraction=out_fraction,
     )
 
     pinned_style: TransitionStyle | None = None

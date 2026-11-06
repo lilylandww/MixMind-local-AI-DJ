@@ -193,6 +193,9 @@ export type Queue = {
   vibe_note: string | null;
   arc_template: string | null;
   tease_hooks: boolean;
+  /** "full" (or null) plays tracks out; "half" mixes out around the
+   * midpoint. The closing track always plays out. */
+  song_length: string | null;
   host_frequency: string | null;
   host_persona: string | null;
   items: QueueItem[];
@@ -203,6 +206,7 @@ export type QueueContextUpdate = {
   vibe_note?: string | null;
   arc_template?: string | null;
   tease_hooks?: boolean;
+  song_length?: string | null;
   host_frequency?: string | null;
   host_persona?: string | null;
 };
@@ -212,6 +216,7 @@ export type ContextOptions = {
   arcs: { id: string; label: string; description: string }[];
   host_frequencies: string[];
   host_personas: string[];
+  song_lengths: { id: string; label: string }[];
 };
 
 export type MixPlanStatus = "pending" | "rendering" | "ready" | "failed";

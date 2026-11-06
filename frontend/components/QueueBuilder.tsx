@@ -92,6 +92,26 @@ function GigContext({ queue }: { queue: Queue }) {
           />
           Tease hooks
         </label>
+        <select
+          value={queue.song_length ?? "full"}
+          onChange={(e) =>
+            update.mutate({
+              song_length: e.target.value === "full" ? null : e.target.value,
+            })
+          }
+          title={
+            "How much of each track to keep. Half mixes out around the " +
+            "midpoint, like a DJ working a short slot. The last track " +
+            "always plays out."
+          }
+          className="text-xs border rounded px-2 py-1 bg-transparent"
+        >
+          {options.data.song_lengths.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.label}
+            </option>
+          ))}
+        </select>
       </div>
       <div className="flex gap-2 items-center">
         <select

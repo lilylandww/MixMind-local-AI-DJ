@@ -104,3 +104,40 @@ def test_context_options_endpoint(client):
     body = resp.json()
     assert any(o["id"] == "gym" for o in body["occasions"])
     assert any(a["id"] == "wave" for a in body["arcs"])
+    # Track-length mode is offered to the queue builder.
+    assert {s["id"] for s in body["song_lengths"]} == {"full", "half"}
+
+
+def test_queue_song_length_patch(client):
+    """Per-queue track-length mode: null/full plays tracks out, half caps
+    the OUT point around the midpoint. Unknown modes are rejected."""
+    import uuid as _uuid
+
+    from app.core.db import SessionLocal
+    from app.models import Queue
+
+    with SessionLocal() as db:
+        q = Queue(locked=False)
+        db.add(q)
+        db.commit()
+        qid = str(q.id)
+    try:
+        # Default: unset => the engine treats it as "full".
+        assert client.get(f"/api/queues/{qid}").json()["song_length"] is None
+
+        resp = client.patch(f"/api/queues/{qid}", json={"song_length": "half"})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["song_length"] == "half"
+
+        assert client.patch(
+            f"/api/queues/{qid}", json={"song_length": "quarter"}
+        ).status_code == 422
+
+        resp = client.patch(f"/api/queues/{qid}", json={"song_length": None})
+        assert resp.json()["song_length"] is None
+    finally:
+        with SessionLocal() as db:
+            row = db.get(Queue, _uuid.UUID(qid))
+            if row is not None:
+                db.delete(row)
+            db.commit()

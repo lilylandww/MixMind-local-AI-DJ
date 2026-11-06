@@ -360,6 +360,12 @@ def list_context_options() -> dict:
         ],
         "host_frequencies": ["off", "intro_only", "sparse", "chatty"],
         "host_personas": sorted(HOST_PERSONAS),
+        # How much of each track the mix keeps. "half" caps the OUT point
+        # around the midpoint; the closing track always plays out.
+        "song_lengths": [
+            {"id": "full", "label": "Full tracks"},
+            {"id": "half", "label": "Half tracks"},
+        ],
     }
 
 
@@ -373,6 +379,7 @@ def update_queue_context(
     teasing. Allowed until the queue is locked (the planners snapshot it
     at plan time)."""
     from app.services.mixer.occasions import ARC_TEMPLATES, OCCASIONS
+    from app.services.mixer.candidates import SONG_LENGTH_FRACTIONS
 
     queue = db.get(Queue, queue_id)
     if queue is None:
@@ -387,6 +394,9 @@ def update_queue_context(
     if "arc_template" in fields and fields["arc_template"] is not None \
             and fields["arc_template"] not in ARC_TEMPLATES:
         raise HTTPException(status_code=422, detail="unknown arc_template")
+    if "song_length" in fields and fields["song_length"] is not None \
+            and fields["song_length"] not in SONG_LENGTH_FRACTIONS:
+        raise HTTPException(status_code=422, detail="unknown song_length")
     if "host_frequency" in fields and fields["host_frequency"] is not None \
             and fields["host_frequency"] not in (
                 "off", "intro_only", "sparse", "chatty"):

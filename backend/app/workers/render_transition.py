@@ -50,7 +50,11 @@ from app.models import (
 )
 from app.models.lyrics import Lyrics, LyricsAlignmentStatus
 from app.services.llm import get_llm_provider
-from app.services.mixer.candidates import enrich_sections, max_seam_time
+from app.services.mixer.candidates import (
+    SONG_LENGTH_FRACTIONS,
+    enrich_sections,
+    max_seam_time,
+)
 from app.services.mixer.executor import render
 from app.services.feedback.summary import feedback_context
 from app.services.mixer.occasions import occasion_context
@@ -230,6 +234,12 @@ def render_transition(mix_plan_id: str) -> str | None:
         # Occasion / vibe / energy-dial context for the decision prompt.
         queue_row = db.get(Queue, row.queue_id)
         tease_enabled = bool(queue_row.tease_hooks) if queue_row else False
+        # Track-length mode: "half" caps this pair's OUT point around A's
+        # midpoint. The closer never appears as an outgoing song, so it
+        # plays out without any special-casing here.
+        out_fraction = SONG_LENGTH_FRACTIONS.get(
+            (queue_row.song_length if queue_row else None) or "full", 1.0
+        )
         extra_context = occasion_context(
             queue_row.occasion if queue_row else None,
             queue_row.vibe_note if queue_row else None,
@@ -378,6 +388,7 @@ def render_transition(mix_plan_id: str) -> str | None:
                 tempo_meet=settings.tempo_meet_in_middle,
                 extra_context=extra_context,
                 tease_enabled=tease_enabled,
+                out_fraction=out_fraction,
             )
 
         # ---- legacy free-form path, with repair-not-reject ----

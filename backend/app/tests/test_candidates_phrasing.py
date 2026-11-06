@@ -94,3 +94,45 @@ def test_in_candidates_land_on_phrase_grid():
         assert c.time in grid or c.time in b.downbeats
     # The intro-end candidate snapped onto the section-30 phrase anchor.
     assert any(c.time == 30.0 for c in cands)
+
+
+def test_out_candidates_full_mode_is_unchanged_by_the_fraction_knob():
+    b = _bundle()
+    energy = [0.5] * int(DUR)
+    default = build_out_candidates(b, energy, [])
+    explicit_full = build_out_candidates(b, energy, [], max_out_fraction=1.0)
+    assert [c.time for c in default] == [c.time for c in explicit_full]
+
+
+def test_out_candidates_capped_to_half_the_track():
+    b = _bundle()
+    cands = build_out_candidates(b, [0.5] * int(DUR), [], max_out_fraction=0.5)
+    assert cands
+    assert all(c.time <= DUR * 0.5 for c in cands)
+    # The "latest allowed" exit survives, so the LLM can always choose to
+    # play as much of the track as the mode permits.
+    assert max(c.time for c in cands) > DUR * 0.5 - 40
+
+
+def test_capped_out_candidates_respect_a_musical_floor():
+    # Without a floor, a coarse section list under a 50% cap offers
+    # "mix out at 0:00" — no DJ leaves a track in its first bars.
+    b = _bundle()
+    cands = build_out_candidates(b, [0.5] * int(DUR), [], max_out_fraction=0.5)
+    assert cands
+    assert all(c.time >= DUR * 0.2 for c in cands)
+
+
+def test_capped_out_candidates_prefer_late_section_boundaries():
+    sections = [
+        {"start": 0.0, "end": 30.0, "label": "intro"},
+        {"start": 30.0, "end": 90.0, "label": "verse"},
+        {"start": 90.0, "end": 150.0, "label": "chorus"},
+        {"start": 150.0, "end": 240.0, "label": "outro"},
+    ]
+    b = _bundle(sections=sections)
+    cands = build_out_candidates(b, [0.5] * int(DUR), [], max_out_fraction=0.5)
+    # 90 s is the last section start under the 120 s cap, so the exit still
+    # lands on a boundary rather than an arbitrary bar.
+    assert any(c.time == 90.0 for c in cands)
+    assert all(c.time <= 120.0 for c in cands)

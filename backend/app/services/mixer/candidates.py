@@ -36,6 +36,15 @@ DEDUP_SECONDS = 2.0
 # B entry points past this fraction of the song are pointless — the
 # listener would barely hear B before the *next* transition starts.
 B_ENTRY_MAX_FRACTION = 0.5
+# Per-queue `song_length` mode -> the fraction of a track the mix keeps
+# before it starts mixing out. "full" plays tracks out; "half" moves at the
+# pace a DJ works a short slot. The last song is never an outgoing song, so
+# it always plays to its natural end regardless of this setting.
+SONG_LENGTH_FRACTIONS = {"full": 1.0, "half": 0.5}
+# Lower bound on an OUT point when the track length is capped. Capping the
+# ceiling alone leaves short/coarse section lists offering "mix out at
+# 0:00" as a menu entry; no DJ leaves a track in its first bars.
+MIN_OUT_FRACTION = 0.2
 # A vocal-safe entry must stay clear of vocals for this many bars after
 # the candidate point for a hard cut to land cleanly.
 VOCAL_SAFE_LOOKAHEAD_BARS = 2.0
@@ -390,15 +399,35 @@ def build_out_candidates(
     a: AnalysisBundle,
     energy_curve: list[float],
     safe_regions: list[dict],
+    *,
+    max_out_fraction: float = 1.0,
 ) -> list[SeamCandidate]:
     """OUT points for the outgoing song A: late-song section starts that
-    leave a full crossfade of headroom, downbeat-snapped."""
-    ceiling = max_seam_time(a.duration, a.bpm, a.time_signature)
-    if ceiling <= 0:
+    leave a full crossfade of headroom, downbeat-snapped.
+
+    `max_out_fraction` caps how far into the track the mix may linger.
+    1.0 (the default) plays A out. 0.5 mixes out around the midpoint so a
+    set moves at the pace a DJ works a short slot — the exit is still
+    chosen from section boundaries, but "late song" is re-derived relative
+    to the cap (the last three sections of the *kept* part) so it lands
+    after a chorus rather than at an arbitrary bar.
+    """
+    hard_ceiling = max_seam_time(a.duration, a.bpm, a.time_signature)
+    if hard_ceiling <= 0:
         return []
+    ceiling = hard_ceiling
     sec_per_bar = (60.0 / a.bpm) * a.time_signature if a.bpm else 0.0
     lookahead = VOCAL_SAFE_LOOKAHEAD_BARS * sec_per_bar
     sections = enrich_sections(a.sections, energy_curve)
+    if max_out_fraction < 1.0:
+        ceiling = min(hard_ceiling, max(0.0, a.duration * max_out_fraction))
+        # Filtering, rather than only lowering `ceiling`, is what lets the
+        # rest of this function work unchanged: every "late song" rule
+        # below is relative to the list it is handed. The floor keeps the
+        # shortened menu musical — without it a two-section track would
+        # offer "mix out at 0:00".
+        floor = a.duration * MIN_OUT_FRACTION
+        sections = [s for s in sections if floor <= s["start"] <= ceiling]
     grid = phrase_grid(a.downbeats, a.sections)
 
     def _out_candidate(t: float, description: str, energy: float) -> SeamCandidate:
@@ -462,7 +491,14 @@ def build_out_candidates(
         raw.append(_out_candidate(t, desc, s["energy"]))
 
     # Always offer "as late as the headroom allows" — the v1 default.
-    late = _snap_to_phrase_at_or_before(ceiling, grid, a.downbeats)
+    if max_out_fraction < 1.0:
+        # Under a cap, snapping *back* to the previous phrase can land far
+        # short of it (a 16-bar boundary often overshoots the cap), which
+        # would leave the shortened menu ending well before "half". Snap
+        # forward instead, falling back to a downbeat at the cap.
+        late = _snap_to_phrase(ceiling, grid, a.downbeats, ceiling)
+    else:
+        late = _snap_to_phrase_at_or_before(ceiling, grid, a.downbeats)
     if late <= ceiling:
         raw.append(_out_candidate(
             late,
@@ -570,8 +606,12 @@ def build_pair_candidates(
     b_energy_curve: list[float],
     a_safe_regions: list[dict],
     b_safe_regions: list[dict],
+    *,
+    out_fraction: float = 1.0,
 ) -> PairCandidates:
     return PairCandidates(
-        out_candidates=build_out_candidates(a, a_energy_curve, a_safe_regions),
+        out_candidates=build_out_candidates(
+            a, a_energy_curve, a_safe_regions, max_out_fraction=out_fraction
+        ),
         in_candidates=build_in_candidates(b, b_energy_curve, b_safe_regions),
     )

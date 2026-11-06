@@ -29,6 +29,7 @@ class QueueRead(BaseModel):
     vibe_note: str | None = None
     arc_template: str | None = None
     tease_hooks: bool = False
+    song_length: str | None = None
     host_frequency: str | None = None
     host_persona: str | None = None
     items: list[QueueItemRead]
@@ -42,6 +43,7 @@ class QueueContextUpdate(BaseModel):
     vibe_note: str | None = None
     arc_template: str | None = None
     tease_hooks: bool | None = None
+    song_length: str | None = None
     host_frequency: str | None = None
     host_persona: str | None = None
 
