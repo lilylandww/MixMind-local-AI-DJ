@@ -92,6 +92,30 @@ function GigContext({ queue }: { queue: Queue }) {
           />
           Tease hooks
         </label>
+        <label className="text-xs flex items-center gap-1.5">
+          Length:
+          <select
+            value={queue.song_length ?? "full"}
+            onChange={(e) =>
+              update.mutate({
+                song_length:
+                  e.target.value === "full" ? null : e.target.value,
+              })
+            }
+            title={
+              "Play through the first chorus only, then mix out. The " +
+              "repeated second chorus is skipped. The last track always " +
+              "plays out."
+            }
+            className="text-xs border rounded px-2 py-1 bg-transparent"
+          >
+            {(options.data.song_lengths ?? []).map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.label}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
       <div className="flex gap-2 items-center">
         <select

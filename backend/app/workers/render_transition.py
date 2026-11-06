@@ -50,7 +50,11 @@ from app.models import (
 )
 from app.models.lyrics import Lyrics, LyricsAlignmentStatus
 from app.services.llm import get_llm_provider
-from app.services.mixer.candidates import enrich_sections, max_seam_time
+from app.services.mixer.candidates import (
+    SONG_LENGTH_FRACTIONS,
+    enrich_sections,
+    max_seam_time,
+)
 from app.services.mixer.executor import render
 from app.services.feedback.summary import feedback_context
 from app.services.mixer.occasions import occasion_context
@@ -230,10 +234,27 @@ def render_transition(mix_plan_id: str) -> str | None:
         # Occasion / vibe / energy-dial context for the decision prompt.
         queue_row = db.get(Queue, row.queue_id)
         tease_enabled = bool(queue_row.tease_hooks) if queue_row else False
+        # Track-length mode: "half" now means one chorus — the OUT is the
+        # end of A's first chorus. The closer never appears as an outgoing
+        # song, so it plays out without any special-casing here.
+        out_fraction = SONG_LENGTH_FRACTIONS.get(
+            (queue_row.song_length if queue_row else None) or "full", 1.0
+        )
+        # The short mode is "one chorus": find the first chorus and mix out
+        # at its end. `out_fraction` is only the fallback cap when the
+        # analyzer can't identify a chorus.
+        one_chorus = out_fraction < 1.0
         extra_context = occasion_context(
             queue_row.occasion if queue_row else None,
             queue_row.vibe_note if queue_row else None,
         )
+        if one_chorus:
+            extra_context["track_length"] = (
+                "ONE-CHORUS SET: each track is mixed out at the end of its "
+                "first chorus; the repeated second chorus is intentionally "
+                "skipped. Choose the IN that makes that one chorus land "
+                "well, and keep the handover tight."
+            )
         if row.energy_bias == "up":
             extra_context["energy_dial"] = (
                 "The listener just asked to RAISE the energy: prefer "
@@ -273,6 +294,12 @@ def render_transition(mix_plan_id: str) -> str | None:
             select(QueueItem).where(QueueItem.queue_id == row.queue_id)
         ).all()
         positions = {it.song_id: it.position for it in queue_items}
+        # The closer is never an outgoing song, so it has no next-exit
+        # budget; the capped-mode IN cap must not constrain its entry.
+        b_is_closer = (
+            bool(positions)
+            and positions.get(row.to_song_id) == max(positions.values())
+        )
         # Whole-song pitch offsets resolved by the set-level pass (0 in
         # "temporary"/"off" modes or before the pass has run).
         pitch_offsets = {
@@ -327,11 +354,27 @@ def render_transition(mix_plan_id: str) -> str | None:
     ) -> PlanOutcome:
         nonlocal a_bundle, b_bundle
 
+        # The legacy free-form prompt has no capped-seam contract and the
+        # repair/validate step doesn't enforce one. Refuse rather than
+        # silently rendering full-length transitions.
+        if (
+            out_fraction < 1.0
+            and settings.use_llm_planner
+            and settings.planner_version != "v2"
+        ):
+            raise RuntimeError(
+                "track-length mode requires PLANNER_VERSION=v2 "
+                f"(got {settings.planner_version!r})"
+            )
+
         if not settings.use_llm_planner:
             return PlanOutcome(
                 plan=build_pair_plan(
                     effective_bundle(a_bundle, a_pitch_offset),
                     effective_bundle(b_bundle, b_pitch_offset),
+                    max_out_fraction=out_fraction,
+                    one_chorus=one_chorus,
+                    a_energy_curve=a_energy_curve,
                 ),
                 source="deterministic", style=None, rationale=None,
             )
@@ -378,6 +421,9 @@ def render_transition(mix_plan_id: str) -> str | None:
                 tempo_meet=settings.tempo_meet_in_middle,
                 extra_context=extra_context,
                 tease_enabled=tease_enabled,
+                out_fraction=out_fraction,
+                one_chorus=one_chorus,
+                b_is_closer=b_is_closer,
             )
 
         # ---- legacy free-form path, with repair-not-reject ----
@@ -407,20 +453,31 @@ def render_transition(mix_plan_id: str) -> str | None:
                 "to deterministic: %s", exc,
             )
             return PlanOutcome(
-                plan=build_pair_plan(a_eff, b_eff),
+                plan=build_pair_plan(
+                    a_eff, b_eff,
+                    max_out_fraction=out_fraction,
+                    one_chorus=one_chorus,
+                    a_energy_curve=a_energy_curve,
+                ),
                 source="deterministic_fallback", style=None, rationale=None,
             )
 
-    if existing_plan_json:
-        outcome = PlanOutcome(
-            plan=existing_plan_json, source="cached", style=None, rationale=None
-        )
-    else:
-        outcome = asyncio.run(_build_plan())
-        logger.info(
-            "render_transition: %s plan source=%s style=%s",
-            mix_plan_id, outcome.source, outcome.style,
-        )
+    try:
+        if existing_plan_json:
+            outcome = PlanOutcome(
+                plan=existing_plan_json, source="cached", style=None,
+                rationale=None,
+            )
+        else:
+            outcome = asyncio.run(_build_plan())
+            logger.info(
+                "render_transition: %s plan source=%s style=%s",
+                mix_plan_id, outcome.source, outcome.style,
+            )
+    except Exception as exc:
+        logger.exception("render_transition: %s planning failed", mix_plan_id)
+        _mark_failed(plan_uuid, f"{type(exc).__name__}: {exc}")
+        return None
 
     def _finalize_plan(plan: list[dict]) -> list[dict]:
         # Outside "temporary" mode no plan may carry pitch tools: whole-song

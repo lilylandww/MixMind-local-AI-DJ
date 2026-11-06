@@ -247,6 +247,7 @@ def _tempo_and_pitch_calls(
     pitch_mode: str = "temporary",
     tempo_ratio: float = 1.0,
     meet_bpm: float | None = None,
+    max_safe_start: float | None = None,
 ) -> list[dict]:
     """Tempo ramp + temporary pitch return, both anchored strictly AFTER
     the bar where the last stem finishes its fade. Computed, not prompted.
@@ -272,8 +273,26 @@ def _tempo_and_pitch_calls(
     ramp_bars = TEMPO_RAMP_BARS
     while ramp_bars >= 8 and crossfade_end_b + ramp_bars * spb_b > ceiling_b:
         ramp_bars //= 2
+    if max_safe_start is not None:
+        max_ramp_bars = (
+            int((max_safe_start - crossfade_end_b) / spb_b) if spb_b else 0
+        )
+        if max_ramp_bars < 4:
+            ramp_bars = 0
+        elif ramp_bars > max_ramp_bars:
+            logger.info(
+                "archetypes: shortening B tempo ramp %d -> %d bars to "
+                "clear the next exit at %.1fs",
+                ramp_bars, max_ramp_bars, max_safe_start,
+            )
+            ramp_bars = max_ramp_bars
     ramp_end_b = crossfade_end_b + ramp_bars * spb_b
-    if needs_ramp and b.duration >= ramp_end_b and ramp_end_b <= ceiling_b:
+    if (
+        needs_ramp
+        and ramp_bars >= 4
+        and b.duration >= ramp_end_b
+        and ramp_end_b <= ceiling_b
+    ):
         calls.append({
             "tool": "set_tempo_ramp", "song": "B",
             "start_time": round(crossfade_end_b, 3),
@@ -613,8 +632,16 @@ def expand(
     loudness_match: bool = True,
     bass_swap: bool = True,
     tempo_meet: bool = True,
+    max_safe_start: float | None = None,
 ) -> MixPlanJSON:
-    """Expand a validated decision into the final tool-call list."""
+    """Expand a validated decision into the final tool-call list.
+
+    `max_safe_start` (seconds in B's original timeline) is the last moment
+    the incoming transition may still be settling before the NEXT pair
+    mixes B out. The window is shortened to fit, and the B tempo ramp is
+    capped to the remaining room. The candidate cap in planner_v2 uses the
+    same bound, so the stitch never has to collapse the middle song.
+    """
     out_c = candidates.find(decision.out)
     in_c = candidates.find(decision.in_)
     if out_c is None or not decision.out.startswith("A"):
@@ -654,6 +681,23 @@ def expand(
     duration = _clamp_duration_bars(
         decision.normalized_duration(), a, b, seam_a, seam_b, tempo_ratio
     )
+    if max_safe_start is not None:
+        spb_b = _sec_per_bar(b)
+        max_bars = (
+            int((max_safe_start - seam_b) / (spb_b * tempo_ratio))
+            if spb_b and tempo_ratio else duration
+        )
+        if max_bars < 2:
+            raise ArchetypeError(
+                "no room for the incoming transition before the next exit "
+                f"(need 2 bars, have {max_safe_start - seam_b:.1f}s)"
+            )
+        if duration > max_bars:
+            logger.info(
+                "archetypes: shortening crossfade %d -> %d bars to clear "
+                "the next exit at %.1fs", duration, max_bars, max_safe_start,
+            )
+            duration = max_bars
     a_fade = decision.normalized_a_fade(duration)
     spb_a = _sec_per_bar(a)
 
@@ -889,7 +933,7 @@ def expand(
         *loudness_calls,
         *_tempo_and_pitch_calls(
             a, b, seam_b, crossfade_total_bars, pitch_mode, tempo_ratio,
-            meet_bpm,
+            meet_bpm, max_safe_start,
         ),
         *stem_calls,
     ]

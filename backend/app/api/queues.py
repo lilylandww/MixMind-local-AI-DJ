@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.core.config import settings
 from app.models import (
     MixPlan,
     Queue,
@@ -360,6 +361,13 @@ def list_context_options() -> dict:
         ],
         "host_frequencies": ["off", "intro_only", "sparse", "chatty"],
         "host_personas": sorted(HOST_PERSONAS),
+        # How much of each track the mix keeps. "half" plays through the
+        # first chorus and mixes out at its end; the closing track always
+        # plays out. "full" stores as NULL.
+        "song_lengths": [
+            {"id": "full", "label": "Full tracks"},
+            {"id": "half", "label": "One chorus"},
+        ],
     }
 
 
@@ -370,9 +378,10 @@ def update_queue_context(
     db: Session = Depends(get_db),
 ) -> Queue:
     """Set the gig context: occasion, vibe note, arc template, hook
-    teasing. Allowed until the queue is locked (the planners snapshot it
-    at plan time)."""
+    teasing, track length. Allowed until the queue is locked (the
+    planners snapshot it at plan time)."""
     from app.services.mixer.occasions import ARC_TEMPLATES, OCCASIONS
+    from app.services.mixer.candidates import SONG_LENGTH_FRACTIONS
 
     queue = db.get(Queue, queue_id)
     if queue is None:
@@ -381,12 +390,27 @@ def update_queue_context(
         raise HTTPException(status_code=409, detail="queue is locked")
 
     fields = payload.model_dump(exclude_unset=True)
+    # NULL and "full" are the same mode; store one canonical form.
+    if fields.get("song_length") == "full":
+        fields["song_length"] = None
     if "occasion" in fields and fields["occasion"] is not None \
             and fields["occasion"] not in OCCASIONS:
         raise HTTPException(status_code=422, detail="unknown occasion")
     if "arc_template" in fields and fields["arc_template"] is not None \
             and fields["arc_template"] not in ARC_TEMPLATES:
         raise HTTPException(status_code=422, detail="unknown arc_template")
+    if "song_length" in fields and fields["song_length"] is not None \
+            and fields["song_length"] not in SONG_LENGTH_FRACTIONS:
+        raise HTTPException(status_code=422, detail="unknown song_length")
+    if (
+        fields.get("song_length")
+        and settings.use_llm_planner
+        and settings.planner_version != "v2"
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="track-length modes require PLANNER_VERSION=v2",
+        )
     if "host_frequency" in fields and fields["host_frequency"] is not None \
             and fields["host_frequency"] not in (
                 "off", "intro_only", "sparse", "chatty"):
@@ -572,6 +596,15 @@ def lock_queue(queue_id: uuid.UUID, db: Session = Depends(get_db)) -> Queue:
         raise HTTPException(status_code=409, detail="queue is already locked")
     if not queue.items:
         raise HTTPException(status_code=409, detail="queue is empty")
+    if (
+        queue.song_length not in (None, "full")
+        and settings.use_llm_planner
+        and settings.planner_version != "v2"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="track-length modes require PLANNER_VERSION=v2",
+        )
 
     queue.locked = True
     queue.locked_at = datetime.now(timezone.utc)

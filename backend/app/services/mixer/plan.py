@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 
+from app.services.mixer.candidates import first_chorus_section, max_seam_time
 from app.services.mixer.types import AnalysisBundle, MixPlanJSON
 
 logger = logging.getLogger(__name__)
@@ -89,15 +90,64 @@ def _snap_to_downbeat(t: float, downbeats: list[float]) -> float:
     return downbeats[-1]
 
 
-def build_pair_plan(a: AnalysisBundle, b: AnalysisBundle) -> MixPlanJSON:
-    """Build the tool-call list for the A → B transition."""
+def _snap_to_downbeat_at_or_before(t: float, downbeats: list[float]) -> float:
+    """Latest downbeat ≤ t, or the first downbeat if none qualifies."""
+    if not downbeats:
+        return t
+    best = None
+    for d in downbeats:
+        if d <= t:
+            best = d
+        else:
+            break
+    return best if best is not None else downbeats[0]
+
+
+def build_pair_plan(
+    a: AnalysisBundle,
+    b: AnalysisBundle,
+    *,
+    max_out_fraction: float = 1.0,
+    one_chorus: bool = False,
+    a_energy_curve: list[float] | None = None,
+) -> MixPlanJSON:
+    """Build the tool-call list for the A → B transition.
+
+    `max_out_fraction` < 1.0 caps the A seam for the short-format modes.
+    It mirrors the v2 candidate menu: use the later of the last section
+    start under the cap and the last downbeat under it, so a capped fallback
+    still gets roughly half the track rather than an arbitrary early
+    section. The IN/ramp budget is enforced by the v2 planner; this
+    deterministic path keeps B's entry at the post-intro downbeat, which is
+    early enough in practice.
+    """
     sec_per_bar_a = (60.0 / a.bpm) * a.time_signature
     max_outro_seconds = DEFAULT_DURATION_BARS * sec_per_bar_a
 
     # A seam: last section start, clamped to "no more than 16 bars before end".
     last_section_start = a.sections[-1]["start"] if a.sections else 0.0
-    seam_a_raw = max(last_section_start, a.duration - max_outro_seconds)
-    seam_a = _snap_to_downbeat(seam_a_raw, a.downbeats)
+    chorus = (
+        first_chorus_section(a.sections, a_energy_curve or [])
+        if one_chorus else None
+    )
+    if chorus is not None:
+        ceiling = max_seam_time(a.duration, a.bpm, a.time_signature)
+        seam_a = _snap_to_downbeat(float(chorus["end"]), a.downbeats)
+        if seam_a > ceiling:
+            seam_a = _snap_to_downbeat_at_or_before(ceiling, a.downbeats)
+        if seam_a <= 0:
+            chorus = None
+    if chorus is None and max_out_fraction < 1.0:
+        cap = a.duration * max_out_fraction
+        under_cap = [s["start"] for s in a.sections if s["start"] <= cap]
+        cap_anchor = max(under_cap) if under_cap else cap
+        cap_downbeat = _snap_to_downbeat_at_or_before(cap, a.downbeats)
+        seam_a = _snap_to_downbeat_at_or_before(
+            max(cap_anchor, cap_downbeat), a.downbeats
+        )
+    elif chorus is None:
+        seam_a_raw = max(last_section_start, a.duration - max_outro_seconds)
+        seam_a = _snap_to_downbeat(seam_a_raw, a.downbeats)
 
     # B seam: first downbeat ≥ end of first section.
     first_section_end = b.sections[0]["end"] if b.sections else 0.0

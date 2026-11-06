@@ -10,6 +10,7 @@ from __future__ import annotations
 from app.services.mixer.candidates import (
     build_in_candidates,
     build_out_candidates,
+    cap_in_candidates_for_out,
     max_seam_time,
     phrase_grid,
     _snap_to_phrase,
@@ -94,3 +95,166 @@ def test_in_candidates_land_on_phrase_grid():
         assert c.time in grid or c.time in b.downbeats
     # The intro-end candidate snapped onto the section-30 phrase anchor.
     assert any(c.time == 30.0 for c in cands)
+
+
+def test_out_candidates_full_mode_is_unchanged_by_the_fraction_knob():
+    b = _bundle()
+    energy = [0.5] * int(DUR)
+    default = build_out_candidates(b, energy, [])
+    explicit_full = build_out_candidates(b, energy, [], max_out_fraction=1.0)
+    assert [c.time for c in default] == [c.time for c in explicit_full]
+
+
+def test_out_candidates_capped_to_half_the_track():
+    b = _bundle()
+    cands = build_out_candidates(b, [0.5] * int(DUR), [], max_out_fraction=0.5)
+    assert cands
+    assert all(c.time <= DUR * 0.5 for c in cands)
+    # The "latest allowed" exit survives and is close to the cap. This is
+    # the regression that the earlier threshold (> 80 s) missed: snapping
+    # back to the previous phrase produced 94 s and passed.
+    assert max(c.time for c in cands) >= DUR * 0.5 - 2
+
+
+def test_capped_out_candidates_survive_non_bar_aligned_durations():
+    # 4:01 with a coarse intro/body/outro: the cap (120.5 s) isn't a bar
+    # boundary. Snapping forward used to overshoot and drop the only
+    # candidate, producing an empty menu and a silent full-length fallback.
+    b = _bundle(duration=241.0)
+    cands = build_out_candidates(b, [0.5] * 241, [], max_out_fraction=0.5)
+    assert cands
+    assert max(c.time for c in cands) >= 241.0 * 0.5 - 2
+    assert all(c.time <= 241.0 * 0.5 for c in cands)
+
+
+def test_capped_out_candidates_respect_a_musical_floor():
+    # Without a floor, a coarse section list under a 50% cap offers
+    # "mix out at 0:00" — no DJ leaves a track in its first bars.
+    b = _bundle()
+    cands = build_out_candidates(b, [0.5] * int(DUR), [], max_out_fraction=0.5)
+    assert cands
+    assert all(c.time >= DUR * 0.2 for c in cands)
+
+
+def test_capped_out_candidates_prefer_late_section_boundaries():
+    sections = [
+        {"start": 0.0, "end": 30.0, "label": "intro"},
+        {"start": 30.0, "end": 90.0, "label": "verse"},
+        {"start": 90.0, "end": 150.0, "label": "chorus"},
+        {"start": 150.0, "end": 240.0, "label": "outro"},
+    ]
+    b = _bundle(sections=sections)
+    cands = build_out_candidates(b, [0.5] * int(DUR), [], max_out_fraction=0.5)
+    # 90 s is the last section start under the 120 s cap, so it stays in
+    # the menu. The capped "latest possible" point at 120 s also survives:
+    # that is the exit that makes the mode actually ~half.
+    assert any(c.time == 90.0 for c in cands)
+    assert any(c.time == 120.0 for c in cands)
+    assert max(c.time for c in cands) == 120.0
+
+
+def test_cap_in_candidates_clears_the_next_out():
+    b = _bundle(sections=[
+        {"start": 0.0, "end": 30.0, "label": "intro"},
+        {"start": 30.0, "end": 90.0, "label": "verse"},
+        {"start": 90.0, "end": 150.0, "label": "chorus"},
+        {"start": 150.0, "end": 240.0, "label": "outro"},
+    ])
+    energy = [0.3] * 30 + [0.5] * 60 + [0.95] * 60 + [0.3] * 90
+    in_cands = build_in_candidates(b, energy, [])
+    assert any(c.time == 90.0 for c in in_cands)
+
+    # The next pair can exit at 90 s, so a 90 s entry plus any blend would
+    # overlap; only the post-intro entry survives.
+    kept = cap_in_candidates_for_out(
+        in_cands, 90.0, 2.0, needs_ramp=True
+    )
+    assert [c.time for c in kept] == [30.0]
+
+    # If the next pair's earliest exit is the 120 s cap, the 90 s entry
+    # is still legal and should remain available.
+    kept = cap_in_candidates_for_out(
+        in_cands, 120.0, 2.0, needs_ramp=True
+    )
+    assert [c.time for c in kept] == [30.0, 90.0]
+
+
+# ------------------------------------------------------- one-chorus mode
+
+def _chorus_energy() -> list[float]:
+    # intro quiet, verse medium, chorus hot, outro quiet (4:00 @ 1 Hz)
+    return [0.3] * 30 + [0.5] * 60 + [0.95] * 60 + [0.3] * 90
+
+
+def _four_sections():
+    return [
+        {"start": 0.0, "end": 30.0, "label": "intro"},
+        {"start": 30.0, "end": 90.0, "label": "verse"},
+        {"start": 90.0, "end": 150.0, "label": "chorus"},
+        {"start": 150.0, "end": 240.0, "label": "outro"},
+    ]
+
+
+def test_one_chorus_outs_at_the_end_of_the_first_chorus():
+    b = _bundle(sections=_four_sections())
+    cands = build_out_candidates(
+        b, _chorus_energy(), [], max_out_fraction=0.5, one_chorus=True
+    )
+    assert [c.time for c in cands] == [150.0]
+    assert "first chorus" in cands[0].description
+
+
+def test_one_chorus_skips_the_repeated_second_chorus():
+    sections = [
+        {"start": 0.0, "end": 30.0, "label": "intro"},
+        {"start": 30.0, "end": 90.0, "label": "verse"},
+        {"start": 90.0, "end": 150.0, "label": "chorus"},
+        {"start": 150.0, "end": 180.0, "label": "verse"},
+        {"start": 180.0, "end": 240.0, "label": "chorus"},
+    ]
+    energy = [0.3] * 30 + [0.5] * 60 + [0.95] * 60 + [0.5] * 30 + [0.95] * 60
+    b = _bundle(sections=sections)
+    cands = build_out_candidates(
+        b, energy, [], max_out_fraction=0.5, one_chorus=True
+    )
+    assert [c.time for c in cands] == [150.0]
+    # The second chorus starts at 180 s and is never played.
+    assert all(c.time < 180.0 for c in cands)
+
+
+def test_one_chorus_prefers_functional_labels_over_flat_energy():
+    # A detector that labels the chorus but whose energy curve is flat.
+    b = _bundle(sections=_four_sections())
+    cands = build_out_candidates(
+        b, [0.5] * int(DUR), [], max_out_fraction=0.5, one_chorus=True
+    )
+    assert [c.time for c in cands] == [150.0]
+
+
+def test_one_chorus_uses_repeated_opaque_clusters():
+    # librosa's default labels are opaque, but similar sections share an
+    # ID: the hot recurring cluster is the chorus.
+    sections = [
+        {"start": 0.0, "end": 30.0, "label": "section_1"},
+        {"start": 30.0, "end": 90.0, "label": "section_2"},
+        {"start": 90.0, "end": 150.0, "label": "section_3"},
+        {"start": 150.0, "end": 180.0, "label": "section_2"},
+        {"start": 180.0, "end": 240.0, "label": "section_3"},
+    ]
+    energy = [0.3] * 30 + [0.5] * 60 + [0.95] * 60 + [0.5] * 30 + [0.95] * 60
+    b = _bundle(sections=sections)
+    cands = build_out_candidates(
+        b, energy, [], max_out_fraction=0.5, one_chorus=True
+    )
+    assert [c.time for c in cands] == [150.0]
+
+
+def test_one_chorus_falls_back_to_the_cap_when_no_chorus_is_detectable():
+    # Flat energy and no functional/duplicated labels: no chorus signal.
+    # The default fixture is intro/body/outro with a flat curve.
+    b = _bundle()
+    cands = build_out_candidates(
+        b, [0.5] * int(DUR), [], max_out_fraction=0.5, one_chorus=True
+    )
+    assert cands
+    assert max(c.time for c in cands) == 120.0

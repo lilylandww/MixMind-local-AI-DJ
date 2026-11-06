@@ -219,9 +219,10 @@ docker compose down -v   # optional: fully wipe past data from the containers
 ## Using the app
 
 1. **Get music in.** Search YouTube and add tracks, or use *Import from disk* to drag in files (drop a `.lrc` next to a track and it's used as its lyrics), or import a whole server folder. Add a few and **drag to reorder**.
-2. Click **Done** to lock the queue. The **Processing** view shows each song moving through the pipeline and each transition rendering; failures surface inline with a **Retry**.
-3. When the continuous mix is ready it advances to the **Player**, which streams the stitched set and shows the active transition. You can re‑roll any transition, download the mix as an M4A, or switch to per‑song "Queue Mode."
-4. Per‑song detail — BPM/key, sections, stems, the transcription and how its lyrics aligned — is under `/songs/<id>/debug`, which is the place to look when a cut lands somewhere unexpected.
+2. **Set the shape of the set.** The **gig** panel picks an occasion, an energy arc, and a **track length**: `Full tracks` plays each song out, while `One chorus` plays through the first chorus and mixes out at its end — a typical track repeats its chorus, and a mix only needs one. The chorus is found from real section labels when the analyzer provides them (`SECTION_DETECTOR=allin1`), otherwise from the first high-energy section; if no chorus can be identified it falls back to a ~50% cap. The incoming blend plus tempo ramp are kept clear of the next exit, and the closing track always plays out.
+3. Click **Done** to lock the queue. The **Processing** view shows each song moving through the pipeline and each transition rendering; failures surface inline with a **Retry**.
+4. When the continuous mix is ready it advances to the **Player**, which streams the stitched set and shows the active transition. You can re‑roll any transition, download the mix as an M4A, or switch to per‑song "Queue Mode."
+5. Per‑song detail — BPM/key, sections, stems, the transcription and how its lyrics aligned — is under `/songs/<id>/debug`, which is the place to look when a cut lands somewhere unexpected.
 
 ## Tests
 

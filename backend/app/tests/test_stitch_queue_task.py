@@ -313,3 +313,115 @@ def test_stitch_queue_handles_tempo_ramp_in_plan_json():
             QueueRender.queue_id == uuid.UUID(queue_id)
         ))
         assert qr.status == QueueRenderStatus.ready
+
+
+def _set_half_and_plans(queue_id: str, pair0: dict, pair1: dict) -> None:
+    """Rewrite the two seeded plans for a 3-song capped-mode scenario."""
+    with SessionLocal() as db:
+        qid = uuid.UUID(queue_id)
+        q = db.get(Queue, qid)
+        q.song_length = "half"
+        items = db.scalars(
+            select(QueueItem)
+            .where(QueueItem.queue_id == qid)
+            .order_by(QueueItem.position)
+        ).all()
+        plans = db.scalars(
+            select(MixPlan).where(MixPlan.queue_id == qid)
+        ).all()
+        by_from = {p.from_song_id: p for p in plans}
+        by_from[items[0].song_id].plan_json = [pair0]
+        by_from[items[1].song_id].plan_json = [pair1]
+        db.commit()
+
+
+def _cleanup_seed(queue_id: str) -> None:
+    with SessionLocal() as db:
+        qid = uuid.UUID(queue_id)
+        items = db.scalars(
+            select(QueueItem).where(QueueItem.queue_id == qid)
+        ).all()
+        song_ids = [it.song_id for it in items]
+        q = db.get(Queue, qid)
+        if q is not None:
+            db.delete(q)
+        db.flush()
+        for sid in song_ids:
+            song = db.get(Song, sid)
+            if song is not None:
+                db.delete(song)
+        db.commit()
+
+
+def test_stitch_queue_capped_mode_fails_loudly_on_overlap():
+    """A late IN + early OUT used to clamp T_orig to 89 s and collapse the
+    middle song to a zero-length timeline span. In a capped mode the
+    stitcher must fail the render with a clear error instead."""
+    queue_id = _seed_locked_queue(n_songs=3, include_tempo_ramp=False)
+    try:
+        _set_half_and_plans(
+            queue_id,
+            pair0={
+                "tool": "set_transition_window",
+                "from_song_time_start": 30.0,
+                "to_song_time_start": 90.0,
+                "duration_bars": 16,
+            },
+            pair1={
+                "tool": "set_transition_window",
+                "from_song_time_start": 90.0,
+                "to_song_time_start": 30.0,
+                "duration_bars": 8,
+            },
+        )
+        storage = _storage_writing_stereo_wav(samples_per_pair=120 * 44100)
+        with patch("app.workers.stitch_queue.get_storage", return_value=storage):
+            from app.workers.stitch_queue import stitch_queue
+            result = stitch_queue(queue_id)
+
+        assert result is None
+        with SessionLocal() as db:
+            qr = db.scalar(select(QueueRender).where(
+                QueueRender.queue_id == uuid.UUID(queue_id)
+            ))
+            assert qr.status == QueueRenderStatus.failed
+            assert "overlap" in (qr.error_text or "").lower()
+    finally:
+        _cleanup_seed(queue_id)
+
+
+def test_stitch_queue_capped_mode_keeps_middle_song_when_seams_clear():
+    """The same late IN is fine when the next pair exits after its first
+    chorus (150 s): the middle song keeps a real, non-zero span."""
+    queue_id = _seed_locked_queue(n_songs=3, include_tempo_ramp=False)
+    try:
+        _set_half_and_plans(
+            queue_id,
+            pair0={
+                "tool": "set_transition_window",
+                "from_song_time_start": 30.0,
+                "to_song_time_start": 90.0,
+                "duration_bars": 16,
+            },
+            pair1={
+                "tool": "set_transition_window",
+                "from_song_time_start": 150.0,
+                "to_song_time_start": 30.0,
+                "duration_bars": 8,
+            },
+        )
+        storage = _storage_writing_stereo_wav(samples_per_pair=160 * 44100)
+        with patch("app.workers.stitch_queue.get_storage", return_value=storage):
+            from app.workers.stitch_queue import stitch_queue
+            result = stitch_queue(queue_id)
+
+        assert result == queue_id
+        with SessionLocal() as db:
+            qr = db.scalar(select(QueueRender).where(
+                QueueRender.queue_id == uuid.UUID(queue_id)
+            ))
+            assert qr.status == QueueRenderStatus.ready
+            middle = qr.timeline["songs"][1]
+            assert middle["end"] - middle["start"] > 5.0
+    finally:
+        _cleanup_seed(queue_id)

@@ -374,6 +374,7 @@ def stitch_queue(queue_id: str) -> str | None:
         # vocal-safety inputs (the intro clip is placed in its first
         # vocal-free span). All optional; the host degrades to silence.
         queue_row = db.get(Queue, queue_uuid)
+        queue_song_length = queue_row.song_length if queue_row else None
         host_ctx = {
             "occasion": queue_row.occasion if queue_row else None,
             "vibe_note": queue_row.vibe_note if queue_row else None,
@@ -481,11 +482,26 @@ def stitch_queue(queue_id: str) -> str | None:
                 safe_start_T = b_seam0 + dur_bars * sec_per_bar_b * ratio0
 
             safe_end_T = a_seam1
-            T_orig = (safe_start_T + safe_end_T) / 2.0
-            
-            # Prevent overlap failure
-            if T_orig > safe_end_T:
+            if safe_start_T > safe_end_T:
+                # The incoming transition is still settling when the next
+                # one starts. Clamping to `safe_end_T - 1` silently drops
+                # the middle song's body and can collapse its timeline span
+                # to zero. In a capped mode the planner's seam budget should
+                # make this impossible; treat it as a failed render so the
+                # user can re-roll instead of shipping a broken mix.
+                msg = (
+                    f"transition overlap: pair {i} is still settling at "
+                    f"{safe_start_T:.1f}s but pair {i + 1} mixes out at "
+                    f"{safe_end_T:.1f}s"
+                )
+                if queue_song_length and queue_song_length != "full":
+                    logger.error("stitch_queue: %s", msg)
+                    _mark_failed(render_row_id, msg)
+                    return None
+                logger.warning("stitch_queue: %s; clamping", msg)
                 T_orig = safe_end_T - 1.0
+            else:
+                T_orig = (safe_start_T + safe_end_T) / 2.0
                 
             S0 = _get_mix0_sample(plan0, rate_A, T_orig, sr, a_bpm=an_a.bpm)
             S1 = _get_mix1_sample(T_orig, sr)

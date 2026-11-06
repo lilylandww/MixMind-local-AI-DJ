@@ -29,19 +29,22 @@ class QueueRead(BaseModel):
     vibe_note: str | None = None
     arc_template: str | None = None
     tease_hooks: bool = False
+    song_length: str | None = None
     host_frequency: str | None = None
     host_persona: str | None = None
     items: list[QueueItemRead]
 
 
 class QueueContextUpdate(BaseModel):
-    """PATCH /api/queues/{id} — occasion / vibe / arc / tease settings.
-    All optional; only provided fields change."""
+    """PATCH /api/queues/{id} — occasion / vibe / arc / tease / track-
+    length settings. All optional; only provided fields change.
+    `song_length` accepts "full" / "half"; "full" is stored as NULL."""
 
     occasion: str | None = None
     vibe_note: str | None = None
     arc_template: str | None = None
     tease_hooks: bool | None = None
+    song_length: str | None = None
     host_frequency: str | None = None
     host_persona: str | None = None
 

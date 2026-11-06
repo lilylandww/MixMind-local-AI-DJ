@@ -33,9 +33,12 @@ from app.services.mixer.archetypes import (
     halftime_ratio,
 )
 from app.services.mixer.candidates import (
+    HALF_SEAM_GAP_SECONDS,
     PairCandidates,
+    build_out_candidates,
     build_pair_candidates,
     enrich_sections,
+    max_seam_time,
 )
 from app.services.mixer.decision import TransitionDecision, TransitionStyle
 from app.services.mixer.pitch_resolver import effective_bundle
@@ -194,6 +197,9 @@ async def build_plan_v2(
     tempo_meet: bool = True,
     extra_context: dict | None = None,
     tease_enabled: bool = False,
+    out_fraction: float = 1.0,
+    one_chorus: bool = False,
+    b_is_closer: bool = False,
 ) -> PlanOutcome:
     # Lazy import keeps the mixer package importable without the llm
     # package's heavy provider dependencies (pure unit tests, tooling).
@@ -208,10 +214,48 @@ async def build_plan_v2(
     a_eff = effective_bundle(a.bundle, a.pitch_offset)
     b_eff = effective_bundle(b.bundle, b.pitch_offset)
 
+    # In a capped mode every song except the closer is also an outgoing
+    # song in the next pair. Find the EARLIEST OUT that next pair can
+    # choose, and cap B's entry so the incoming blend + B-side tempo ramp
+    # finish before it. Using the menu minimum (not the cap) is what makes
+    # this hold for whichever OUT that pair picks, with no cross-pair
+    # ordering or shared state.
+    next_out_time: float | None = None
+    if out_fraction < 1.0 and not b_is_closer:
+        b_out = build_out_candidates(
+            b.bundle, b.energy_curve, b.safe_regions,
+            max_out_fraction=out_fraction,
+            one_chorus=one_chorus,
+        )
+        next_out_time = (
+            min(c.time for c in b_out)
+            if b_out
+            else max_seam_time(
+                b.bundle.duration, b.bundle.bpm, b.bundle.time_signature
+            ) or b.bundle.duration
+        )
+        logger.info(
+            "planner_v2: capped mode next OUT for %r is %.1fs; capping IN",
+            b.title, next_out_time,
+        )
+
+    tempo_ratio = halftime_ratio(a_eff.bpm, b_eff.bpm)
+    needs_ramp = bool(
+        a_eff.bpm and b_eff.bpm and abs(a_eff.bpm - b_eff.bpm) > 0.01
+    )
     candidates = build_pair_candidates(
         a.bundle, b.bundle,
         a.energy_curve, b.energy_curve,
         a.safe_regions, b.safe_regions,
+        out_fraction=out_fraction,
+        one_chorus=one_chorus,
+        next_out_time=next_out_time,
+        tempo_ratio=tempo_ratio,
+        needs_ramp=needs_ramp,
+    )
+    max_safe_start = (
+        next_out_time - HALF_SEAM_GAP_SECONDS
+        if next_out_time is not None else None
     )
 
     pinned_style: TransitionStyle | None = None
@@ -226,7 +270,12 @@ async def build_plan_v2(
             "planner_v2: no usable seam candidates; deterministic fallback"
         )
         return PlanOutcome(
-            plan=build_pair_plan(a_eff, b_eff),
+            plan=build_pair_plan(
+                a_eff, b_eff,
+                max_out_fraction=out_fraction,
+                one_chorus=one_chorus,
+                a_energy_curve=a.energy_curve,
+            ),
             source="deterministic_fallback",
             style=None,
             rationale="songs too short for candidate generation",
@@ -401,7 +450,7 @@ async def build_plan_v2(
                 a_safe_regions=a.safe_regions, b_safe_regions=b.safe_regions,
                 a_energy_curve=a.energy_curve, b_energy_curve=b.energy_curve,
                 loudness_match=loudness_match, bass_swap=bass_swap,
-                tempo_meet=tempo_meet,
+                tempo_meet=tempo_meet, max_safe_start=max_safe_start,
             )
             return PlanOutcome(
                 plan=plan, source=source,
@@ -420,7 +469,7 @@ async def build_plan_v2(
             a_safe_regions=a.safe_regions, b_safe_regions=b.safe_regions,
             a_energy_curve=a.energy_curve, b_energy_curve=b.energy_curve,
             loudness_match=loudness_match, bass_swap=bass_swap,
-            tempo_meet=tempo_meet,
+            tempo_meet=tempo_meet, max_safe_start=max_safe_start,
         )
         return PlanOutcome(
             plan=plan, source="style_default",
@@ -429,7 +478,12 @@ async def build_plan_v2(
     except ArchetypeError as exc:
         logger.error("planner_v2: default expansion failed (%s)", exc)
         return PlanOutcome(
-            plan=build_pair_plan(a_eff, b_eff),
+            plan=build_pair_plan(
+                a_eff, b_eff,
+                max_out_fraction=out_fraction,
+                one_chorus=one_chorus,
+                a_energy_curve=a.energy_curve,
+            ),
             source="deterministic_fallback",
             style=None, rationale=None,
         )
