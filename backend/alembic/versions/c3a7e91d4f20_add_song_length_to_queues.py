@@ -4,8 +4,9 @@ Revision ID: c3a7e91d4f20
 Revises: b8f4c2d1a903
 Create Date: 2026-11-06 10:00:00.000000
 
-Per-queue track-length mode. NULL = "full" (play tracks out); "half" caps
-the OUT point around the midpoint so a set moves at DJ-slot pace.
+Per-queue track-length mode. NULL = "full" (play tracks out); "half"
+plays through the first chorus and mixes out at its end, skipping the
+repeated second chorus.
 """
 from typing import Sequence, Union
 

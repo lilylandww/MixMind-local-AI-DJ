@@ -50,9 +50,10 @@ class Queue(Base):
         Boolean, nullable=False, server_default="false", default=False
     )
     # How much of each track the mix keeps: "full" (null) plays tracks out,
-    # "half" caps the OUT point around the midpoint so the set moves at
-    # DJ-slot pace. See SONG_LENGTH_FRACTIONS in services/mixer/candidates.
-    # The last song is never an outgoing song, so it always plays out.
+    # "half" plays through the first chorus and mixes out at its end (the
+    # repeated second chorus is skipped). See SONG_LENGTH_FRACTIONS and
+    # first_chorus_section in services/mixer/candidates. The last song is
+    # never an outgoing song, so it always plays out.
     song_length: Mapped[str | None] = mapped_column(String, nullable=True)
     # TTS host (F11). frequency: "off" | "intro_only" | "sparse" | "chatty"
     # (null = settings default); persona: "hype" | "latenight" | "radio" |

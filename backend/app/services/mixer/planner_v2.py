@@ -198,6 +198,7 @@ async def build_plan_v2(
     extra_context: dict | None = None,
     tease_enabled: bool = False,
     out_fraction: float = 1.0,
+    one_chorus: bool = False,
     b_is_closer: bool = False,
 ) -> PlanOutcome:
     # Lazy import keeps the mixer package importable without the llm
@@ -224,6 +225,7 @@ async def build_plan_v2(
         b_out = build_out_candidates(
             b.bundle, b.energy_curve, b.safe_regions,
             max_out_fraction=out_fraction,
+            one_chorus=one_chorus,
         )
         next_out_time = (
             min(c.time for c in b_out)
@@ -246,6 +248,7 @@ async def build_plan_v2(
         a.energy_curve, b.energy_curve,
         a.safe_regions, b.safe_regions,
         out_fraction=out_fraction,
+        one_chorus=one_chorus,
         next_out_time=next_out_time,
         tempo_ratio=tempo_ratio,
         needs_ramp=needs_ramp,
@@ -268,7 +271,10 @@ async def build_plan_v2(
         )
         return PlanOutcome(
             plan=build_pair_plan(
-                a_eff, b_eff, max_out_fraction=out_fraction
+                a_eff, b_eff,
+                max_out_fraction=out_fraction,
+                one_chorus=one_chorus,
+                a_energy_curve=a.energy_curve,
             ),
             source="deterministic_fallback",
             style=None,
@@ -473,7 +479,10 @@ async def build_plan_v2(
         logger.error("planner_v2: default expansion failed (%s)", exc)
         return PlanOutcome(
             plan=build_pair_plan(
-                a_eff, b_eff, max_out_fraction=out_fraction
+                a_eff, b_eff,
+                max_out_fraction=out_fraction,
+                one_chorus=one_chorus,
+                a_energy_curve=a.energy_curve,
             ),
             source="deterministic_fallback",
             style=None, rationale=None,

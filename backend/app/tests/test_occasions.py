@@ -104,8 +104,11 @@ def test_context_options_endpoint(client):
     body = resp.json()
     assert any(o["id"] == "gym" for o in body["occasions"])
     assert any(a["id"] == "wave" for a in body["arcs"])
-    # Track-length mode is offered to the queue builder.
+    # Track-length mode is offered to the queue builder. The short mode
+    # is labelled by its intent (one chorus), not by the fallback cap.
     assert {s["id"] for s in body["song_lengths"]} == {"full", "half"}
+    labels = {s["id"]: s["label"] for s in body["song_lengths"]}
+    assert labels["half"] == "One chorus"
 
 
 def test_queue_song_length_patch(client):

@@ -849,6 +849,7 @@ def test_render_transition_passes_capped_fraction_to_v2(pair_with_plan):
     assert result == pair_with_plan["plan_id"]
     kwargs = plan_mock.call_args.kwargs
     assert kwargs["out_fraction"] == 0.5
+    assert kwargs["one_chorus"] is True
     # B is the last song, so the entry must not be constrained by a
     # non-existent next exit.
     assert kwargs["b_is_closer"] is True
@@ -878,7 +879,10 @@ def test_render_transition_deterministic_honors_track_length(pair_with_plan):
         result = render_transition(pair_with_plan["plan_id"])
 
     assert result == pair_with_plan["plan_id"]
-    assert pair_plan_mock.call_args.kwargs["max_out_fraction"] == 0.5
+    kwargs = pair_plan_mock.call_args.kwargs
+    assert kwargs["max_out_fraction"] == 0.5
+    assert kwargs["one_chorus"] is True
+    assert kwargs["a_energy_curve"] is not None
 
 
 def test_render_transition_rejects_capped_mode_on_legacy_planner(pair_with_plan):

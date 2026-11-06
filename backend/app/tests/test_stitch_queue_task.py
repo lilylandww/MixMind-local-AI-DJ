@@ -391,8 +391,8 @@ def test_stitch_queue_capped_mode_fails_loudly_on_overlap():
 
 
 def test_stitch_queue_capped_mode_keeps_middle_song_when_seams_clear():
-    """The same late IN is fine when the next pair exits at the 50% cap:
-    the middle song keeps a real, non-zero span."""
+    """The same late IN is fine when the next pair exits after its first
+    chorus (150 s): the middle song keeps a real, non-zero span."""
     queue_id = _seed_locked_queue(n_songs=3, include_tempo_ramp=False)
     try:
         _set_half_and_plans(
@@ -401,16 +401,16 @@ def test_stitch_queue_capped_mode_keeps_middle_song_when_seams_clear():
                 "tool": "set_transition_window",
                 "from_song_time_start": 30.0,
                 "to_song_time_start": 90.0,
-                "duration_bars": 8,
+                "duration_bars": 16,
             },
             pair1={
                 "tool": "set_transition_window",
-                "from_song_time_start": 120.0,
+                "from_song_time_start": 150.0,
                 "to_song_time_start": 30.0,
                 "duration_bars": 8,
             },
         )
-        storage = _storage_writing_stereo_wav(samples_per_pair=130 * 44100)
+        storage = _storage_writing_stereo_wav(samples_per_pair=160 * 44100)
         with patch("app.workers.stitch_queue.get_storage", return_value=storage):
             from app.workers.stitch_queue import stitch_queue
             result = stitch_queue(queue_id)

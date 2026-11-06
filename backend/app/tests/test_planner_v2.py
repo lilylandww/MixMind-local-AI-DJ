@@ -1131,3 +1131,41 @@ def test_planner_v2_capped_mode_shortens_the_b_ramp_before_the_next_out():
     assert ramp is not None
     assert ramp["end_time"] <= 90.0
     validate_plan(outcome.plan)
+
+
+def test_planner_v2_one_chorus_outs_after_the_first_chorus():
+    """The intended short mode: A's only OUT is the end of its first
+    chorus (150 s), and because that is later than the old 50% cap, B may
+    legally enter on its own chorus at 90 s."""
+    a = SongMeta(
+        "A", None, _four_section_bundle(120.0),
+        _four_section_energy(), FULL_SAFE,
+    )
+    b = SongMeta(
+        "B", None, _four_section_bundle(125.0),
+        _four_section_energy(), FULL_SAFE,
+    )
+    provider = StubProvider(response={
+        "out": "A1", "in": "B2", "style": "smooth_blend", "duration_bars": 8,
+    })
+    outcome = asyncio.run(build_plan_v2(
+        provider, a, b,
+        out_fraction=0.5, one_chorus=True, b_is_closer=False,
+    ))
+    window = next(
+        c for c in outcome.plan if c["tool"] == "set_transition_window"
+    )
+    assert window["from_song_time_start"] == 150.0
+    # The phrase/downbeat snap at 125 BPM lands just after 90 s.
+    assert 89.0 <= window["to_song_time_start"] <= 91.0
+    # The repeated second chorus starts at 180 s and is never played.
+    assert window["from_song_time_start"] < 180.0
+    # The seam budget still keeps the incoming ramp before B's own OUT.
+    ramp = next(
+        (c for c in outcome.plan
+         if c["tool"] == "set_tempo_ramp" and c.get("song") != "A"),
+        None,
+    )
+    assert ramp is not None
+    assert ramp["end_time"] <= 150.0
+    validate_plan(outcome.plan)

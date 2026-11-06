@@ -234,22 +234,26 @@ def render_transition(mix_plan_id: str) -> str | None:
         # Occasion / vibe / energy-dial context for the decision prompt.
         queue_row = db.get(Queue, row.queue_id)
         tease_enabled = bool(queue_row.tease_hooks) if queue_row else False
-        # Track-length mode: "half" caps this pair's OUT point around A's
-        # midpoint. The closer never appears as an outgoing song, so it
-        # plays out without any special-casing here.
+        # Track-length mode: "half" now means one chorus — the OUT is the
+        # end of A's first chorus. The closer never appears as an outgoing
+        # song, so it plays out without any special-casing here.
         out_fraction = SONG_LENGTH_FRACTIONS.get(
             (queue_row.song_length if queue_row else None) or "full", 1.0
         )
+        # The short mode is "one chorus": find the first chorus and mix out
+        # at its end. `out_fraction` is only the fallback cap when the
+        # analyzer can't identify a chorus.
+        one_chorus = out_fraction < 1.0
         extra_context = occasion_context(
             queue_row.occasion if queue_row else None,
             queue_row.vibe_note if queue_row else None,
         )
-        if out_fraction < 1.0:
+        if one_chorus:
             extra_context["track_length"] = (
-                "SHORT-FORMAT SET: each track is mixed out at or before its "
-                "midpoint. Prefer the latest safe OUT candidate unless an "
-                "earlier section boundary is clearly the stronger musical "
-                "exit, and keep handovers tight."
+                "ONE-CHORUS SET: each track is mixed out at the end of its "
+                "first chorus; the repeated second chorus is intentionally "
+                "skipped. Choose the IN that makes that one chorus land "
+                "well, and keep the handover tight."
             )
         if row.energy_bias == "up":
             extra_context["energy_dial"] = (
@@ -369,6 +373,8 @@ def render_transition(mix_plan_id: str) -> str | None:
                     effective_bundle(a_bundle, a_pitch_offset),
                     effective_bundle(b_bundle, b_pitch_offset),
                     max_out_fraction=out_fraction,
+                    one_chorus=one_chorus,
+                    a_energy_curve=a_energy_curve,
                 ),
                 source="deterministic", style=None, rationale=None,
             )
@@ -416,6 +422,7 @@ def render_transition(mix_plan_id: str) -> str | None:
                 extra_context=extra_context,
                 tease_enabled=tease_enabled,
                 out_fraction=out_fraction,
+                one_chorus=one_chorus,
                 b_is_closer=b_is_closer,
             )
 
@@ -447,7 +454,10 @@ def render_transition(mix_plan_id: str) -> str | None:
             )
             return PlanOutcome(
                 plan=build_pair_plan(
-                    a_eff, b_eff, max_out_fraction=out_fraction
+                    a_eff, b_eff,
+                    max_out_fraction=out_fraction,
+                    one_chorus=one_chorus,
+                    a_energy_curve=a_energy_curve,
                 ),
                 source="deterministic_fallback", style=None, rationale=None,
             )

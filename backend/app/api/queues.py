@@ -361,11 +361,12 @@ def list_context_options() -> dict:
         ],
         "host_frequencies": ["off", "intro_only", "sparse", "chatty"],
         "host_personas": sorted(HOST_PERSONAS),
-        # How much of each track the mix keeps. "half" caps the OUT point
-        # around the midpoint; the closing track always plays out.
+        # How much of each track the mix keeps. "half" plays through the
+        # first chorus and mixes out at its end; the closing track always
+        # plays out. "full" stores as NULL.
         "song_lengths": [
             {"id": "full", "label": "Full tracks"},
-            {"id": "half", "label": "Half tracks"},
+            {"id": "half", "label": "One chorus"},
         ],
     }
 

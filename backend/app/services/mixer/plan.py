@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 
+from app.services.mixer.candidates import first_chorus_section, max_seam_time
 from app.services.mixer.types import AnalysisBundle, MixPlanJSON
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,8 @@ def build_pair_plan(
     b: AnalysisBundle,
     *,
     max_out_fraction: float = 1.0,
+    one_chorus: bool = False,
+    a_energy_curve: list[float] | None = None,
 ) -> MixPlanJSON:
     """Build the tool-call list for the A → B transition.
 
@@ -123,7 +126,18 @@ def build_pair_plan(
 
     # A seam: last section start, clamped to "no more than 16 bars before end".
     last_section_start = a.sections[-1]["start"] if a.sections else 0.0
-    if max_out_fraction < 1.0:
+    chorus = (
+        first_chorus_section(a.sections, a_energy_curve or [])
+        if one_chorus else None
+    )
+    if chorus is not None:
+        ceiling = max_seam_time(a.duration, a.bpm, a.time_signature)
+        seam_a = _snap_to_downbeat(float(chorus["end"]), a.downbeats)
+        if seam_a > ceiling:
+            seam_a = _snap_to_downbeat_at_or_before(ceiling, a.downbeats)
+        if seam_a <= 0:
+            chorus = None
+    if chorus is None and max_out_fraction < 1.0:
         cap = a.duration * max_out_fraction
         under_cap = [s["start"] for s in a.sections if s["start"] <= cap]
         cap_anchor = max(under_cap) if under_cap else cap
@@ -131,7 +145,7 @@ def build_pair_plan(
         seam_a = _snap_to_downbeat_at_or_before(
             max(cap_anchor, cap_downbeat), a.downbeats
         )
-    else:
+    elif chorus is None:
         seam_a_raw = max(last_section_start, a.duration - max_outro_seconds)
         seam_a = _snap_to_downbeat(seam_a_raw, a.downbeats)
 

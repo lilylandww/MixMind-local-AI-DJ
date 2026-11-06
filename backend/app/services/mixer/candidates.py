@@ -19,6 +19,7 @@ arguments so it can be unit-tested in isolation.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from app.services.mixer.types import AnalysisBundle
@@ -36,10 +37,10 @@ DEDUP_SECONDS = 2.0
 # B entry points past this fraction of the song are pointless — the
 # listener would barely hear B before the *next* transition starts.
 B_ENTRY_MAX_FRACTION = 0.5
-# Per-queue `song_length` mode -> the fraction of a track the mix keeps
-# before it starts mixing out. "full" plays tracks out; "half" moves at the
-# pace a DJ works a short slot. The last song is never an outgoing song, so
-# it always plays to its natural end regardless of this setting.
+# Per-queue `song_length` mode -> the FALLBACK fraction used when the
+# analyzer can't identify a chorus. "full" plays tracks out; "half" means
+# one chorus (mix out at the end of the first one). The last song is never
+# an outgoing song, so it always plays to its natural end.
 SONG_LENGTH_FRACTIONS = {"full": 1.0, "half": 0.5}
 # Lower bound on an OUT point when the track length is capped. Capping the
 # ceiling alone leaves short/coarse section lists offering "mix out at
@@ -115,6 +116,80 @@ def enrich_sections(sections: list[dict], energy_curve: list[float]) -> list[dic
             item["label"] = label
         out.append(item)
     return out
+
+
+def _is_chorus_label(label: str | None) -> bool:
+    """True for a functional chorus/drop label, excluding pre-chorus."""
+    if not label:
+        return False
+    tokens = [t for t in re.split(r"[^a-z]+", str(label).lower()) if t]
+    if "pre" in tokens:
+        return False
+    return "chorus" in tokens or "drop" in tokens
+
+
+def first_chorus_section(
+    sections: list[dict], energy_curve: list[float]
+) -> dict | None:
+    """The song's first chorus (or drop), or None when structure is opaque.
+
+    The default librosa detector emits `section_N` cluster labels, so a
+    label-only rule would never fire. Preference order:
+
+      1. a functional label (`chorus` / `drop`, ignoring `pre-chorus`);
+      2. the most energetic *repeated* cluster — librosa gives similar
+         sections the same opaque label, and the chorus is usually the
+         hot cluster that recurs;
+      3. the first high-energy section (the existing drop/chorus proxy).
+
+    Returns the enriched section dict (`start`, `end`, `energy`, and a
+    functional `label` when the detector supplied one).
+    """
+    if not sections:
+        return None
+    enriched = enrich_sections(sections, energy_curve)
+    if not enriched:
+        return None
+
+    # 1. Real labels (allin1 / any future functional detector).
+    for s in enriched:
+        if _is_chorus_label(s.get("label")):
+            return s
+
+    # A flat curve normalises to all-1.0 in enrich_sections, which would
+    # make the intro look like a drop. Without labels, require real
+    # dynamic range before trusting any energy inference.
+    if not energy_curve:
+        return None
+    peak = max(energy_curve)
+    mean = sum(energy_curve) / len(energy_curve)
+    if peak <= 0 or peak - mean < 0.05:
+        return None
+
+    # 2. Opaque cluster labels: the hot cluster that repeats is the
+    # chorus. `enrich_sections` drops these labels from the LLM view, but
+    # the raw sections still carry them for this inference.
+    groups: dict[str, list[dict]] = {}
+    for raw, s in zip(sections, enriched):
+        label = str(raw.get("label") or "")
+        if label:
+            groups.setdefault(label, []).append(s)
+    repeated = [g for g in groups.values() if len(g) >= 2]
+    if repeated:
+        hot = max(
+            repeated,
+            key=lambda g: sum(x["energy"] for x in g) / len(g),
+        )
+        mean = sum(x["energy"] for x in hot) / len(hot)
+        if mean >= 0.75:
+            return hot[0]
+
+    # 3. Energy proxy: the first convincingly hot section.
+    for threshold in (HIGH_ENERGY_THRESHOLD, 0.7):
+        for s in enriched:
+            if s["energy"] >= threshold:
+                return s
+    return None
 
 
 @dataclass(frozen=True)
@@ -418,18 +493,25 @@ def build_out_candidates(
     safe_regions: list[dict],
     *,
     max_out_fraction: float = 1.0,
+    one_chorus: bool = False,
 ) -> list[SeamCandidate]:
     """OUT points for the outgoing song A: late-song section starts that
     leave a full crossfade of headroom, downbeat-snapped.
 
     `max_out_fraction` caps how far into the track the mix may linger.
-    1.0 (the default) plays A out. 0.5 mixes out around the midpoint so a
-    set moves at the pace a DJ works a short slot — the exit is re-derived
-    from the *kept* part (the last three sections under the cap), so it
-    lands on a section/phrase boundary when one exists. The "latest
-    possible" candidate is the last phrase boundary or downbeat at/before
-    the cap, so a capped mode always leaves a usable menu even when the
-    cap falls between bars.
+    1.0 (the default) plays A out. 0.5 is the fallback cap used when
+    `one_chorus` is set but no chorus can be identified — the exit is
+    re-derived from the *kept* part (the last three sections under the
+    cap), so it lands on a section/phrase boundary when one exists. The
+    "latest possible" candidate is the last phrase boundary or downbeat
+    at/before the cap, so a capped mode always leaves a usable menu even
+    when the cap falls between bars.
+
+    `one_chorus` switches to the intended short-format rule: find the
+    song's first chorus and make the ONLY OUT candidate its end. A
+    typical track repeats its chorus, and a mix only needs one — the
+    duration cap is just a fallback for songs whose structure is too
+    opaque to find a chorus.
     """
     hard_ceiling = max_seam_time(a.duration, a.bpm, a.time_signature)
     if hard_ceiling <= 0:
@@ -463,6 +545,30 @@ def build_out_candidates(
 
     raw: list[SeamCandidate] = []
     n = len(sections)
+
+    if one_chorus:
+        chorus = first_chorus_section(a.sections, energy_curve)
+        if chorus is not None:
+            # Start the crossfade on the next downbeat so the whole chorus
+            # is heard. If that overruns the headroom, use the last safe
+            # downbeat (the song plays out).
+            t = _snap_to_downbeat(float(chorus["end"]), a.downbeats)
+            if t > hard_ceiling:
+                t = _snap_to_downbeat_at_or_before(
+                    hard_ceiling, a.downbeats
+                )
+            if 0.0 < t <= hard_ceiling:
+                label = chorus.get("label")
+                label_txt = (
+                    f" ({label})"
+                    if label and not str(label).startswith("section_")
+                    else ""
+                )
+                return _reid([_out_candidate(
+                    t,
+                    "end of first chorus" + label_txt,
+                    float(chorus["energy"]),
+                )], "A")
 
     # The last high-energy section start ("the drop") and the final
     # low-energy section start ("the breakdown/outro") — double_drop and
@@ -669,6 +775,7 @@ def build_pair_candidates(
     b_safe_regions: list[dict],
     *,
     out_fraction: float = 1.0,
+    one_chorus: bool = False,
     next_out_time: float | None = None,
     tempo_ratio: float = 1.0,
     needs_ramp: bool = False,
@@ -685,7 +792,9 @@ def build_pair_candidates(
         )
     return PairCandidates(
         out_candidates=build_out_candidates(
-            a, a_energy_curve, a_safe_regions, max_out_fraction=out_fraction
+            a, a_energy_curve, a_safe_regions,
+            max_out_fraction=out_fraction,
+            one_chorus=one_chorus,
         ),
         in_candidates=in_candidates,
     )

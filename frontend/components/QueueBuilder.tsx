@@ -103,9 +103,9 @@ function GigContext({ queue }: { queue: Queue }) {
               })
             }
             title={
-              "How much of each track to keep. Half mixes out around the " +
-              "midpoint, like a DJ working a short slot. The last track " +
-              "always plays out."
+              "Play through the first chorus only, then mix out. The " +
+              "repeated second chorus is skipped. The last track always " +
+              "plays out."
             }
             className="text-xs border rounded px-2 py-1 bg-transparent"
           >

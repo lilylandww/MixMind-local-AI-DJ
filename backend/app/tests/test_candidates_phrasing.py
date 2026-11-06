@@ -177,3 +177,84 @@ def test_cap_in_candidates_clears_the_next_out():
         in_cands, 120.0, 2.0, needs_ramp=True
     )
     assert [c.time for c in kept] == [30.0, 90.0]
+
+
+# ------------------------------------------------------- one-chorus mode
+
+def _chorus_energy() -> list[float]:
+    # intro quiet, verse medium, chorus hot, outro quiet (4:00 @ 1 Hz)
+    return [0.3] * 30 + [0.5] * 60 + [0.95] * 60 + [0.3] * 90
+
+
+def _four_sections():
+    return [
+        {"start": 0.0, "end": 30.0, "label": "intro"},
+        {"start": 30.0, "end": 90.0, "label": "verse"},
+        {"start": 90.0, "end": 150.0, "label": "chorus"},
+        {"start": 150.0, "end": 240.0, "label": "outro"},
+    ]
+
+
+def test_one_chorus_outs_at_the_end_of_the_first_chorus():
+    b = _bundle(sections=_four_sections())
+    cands = build_out_candidates(
+        b, _chorus_energy(), [], max_out_fraction=0.5, one_chorus=True
+    )
+    assert [c.time for c in cands] == [150.0]
+    assert "first chorus" in cands[0].description
+
+
+def test_one_chorus_skips_the_repeated_second_chorus():
+    sections = [
+        {"start": 0.0, "end": 30.0, "label": "intro"},
+        {"start": 30.0, "end": 90.0, "label": "verse"},
+        {"start": 90.0, "end": 150.0, "label": "chorus"},
+        {"start": 150.0, "end": 180.0, "label": "verse"},
+        {"start": 180.0, "end": 240.0, "label": "chorus"},
+    ]
+    energy = [0.3] * 30 + [0.5] * 60 + [0.95] * 60 + [0.5] * 30 + [0.95] * 60
+    b = _bundle(sections=sections)
+    cands = build_out_candidates(
+        b, energy, [], max_out_fraction=0.5, one_chorus=True
+    )
+    assert [c.time for c in cands] == [150.0]
+    # The second chorus starts at 180 s and is never played.
+    assert all(c.time < 180.0 for c in cands)
+
+
+def test_one_chorus_prefers_functional_labels_over_flat_energy():
+    # A detector that labels the chorus but whose energy curve is flat.
+    b = _bundle(sections=_four_sections())
+    cands = build_out_candidates(
+        b, [0.5] * int(DUR), [], max_out_fraction=0.5, one_chorus=True
+    )
+    assert [c.time for c in cands] == [150.0]
+
+
+def test_one_chorus_uses_repeated_opaque_clusters():
+    # librosa's default labels are opaque, but similar sections share an
+    # ID: the hot recurring cluster is the chorus.
+    sections = [
+        {"start": 0.0, "end": 30.0, "label": "section_1"},
+        {"start": 30.0, "end": 90.0, "label": "section_2"},
+        {"start": 90.0, "end": 150.0, "label": "section_3"},
+        {"start": 150.0, "end": 180.0, "label": "section_2"},
+        {"start": 180.0, "end": 240.0, "label": "section_3"},
+    ]
+    energy = [0.3] * 30 + [0.5] * 60 + [0.95] * 60 + [0.5] * 30 + [0.95] * 60
+    b = _bundle(sections=sections)
+    cands = build_out_candidates(
+        b, energy, [], max_out_fraction=0.5, one_chorus=True
+    )
+    assert [c.time for c in cands] == [150.0]
+
+
+def test_one_chorus_falls_back_to_the_cap_when_no_chorus_is_detectable():
+    # Flat energy and no functional/duplicated labels: no chorus signal.
+    # The default fixture is intro/body/outro with a flat curve.
+    b = _bundle()
+    cands = build_out_candidates(
+        b, [0.5] * int(DUR), [], max_out_fraction=0.5, one_chorus=True
+    )
+    assert cands
+    assert max(c.time for c in cands) == 120.0

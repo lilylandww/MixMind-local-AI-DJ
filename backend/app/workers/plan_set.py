@@ -130,11 +130,15 @@ def _plan_set_inner(queue_uuid: uuid.UUID) -> str | None:
         queue_arc_template = queue.arc_template
         queue_song_length = queue.song_length
 
-        from app.services.mixer.candidates import SONG_LENGTH_FRACTIONS
+        from app.services.mixer.candidates import (
+            SONG_LENGTH_FRACTIONS,
+            first_chorus_section,
+        )
 
         out_fraction = SONG_LENGTH_FRACTIONS.get(
             queue_song_length or "full", 1.0
         )
+        one_chorus = out_fraction < 1.0
 
         songs_payload: list[dict] = []
         for idx, item in enumerate(items):
@@ -146,6 +150,17 @@ def _plan_set_inner(queue_uuid: uuid.UUID) -> str | None:
                 logger.info("plan_set: song %s not analyzed yet; skipping pass",
                             item.song_id)
                 return None
+            duration = song.duration_seconds or 0.0
+            played_fraction = out_fraction
+            if one_chorus:
+                chorus = first_chorus_section(
+                    list(analysis.sections or []),
+                    list(analysis.energy_curve or []),
+                )
+                if chorus and duration > 0:
+                    played_fraction = min(
+                        1.0, float(chorus["end"]) / duration
+                    )
             songs_payload.append({
                 "index": idx,
                 "title": song.title,
@@ -153,9 +168,9 @@ def _plan_set_inner(queue_uuid: uuid.UUID) -> str | None:
                 "bpm": analysis.bpm,
                 "key": analysis.key,
                 "camelot_key": analysis.camelot_key,
-                "duration": round(song.duration_seconds or 0.0, 1),
+                "duration": round(duration, 1),
                 "peak_energy_position": _peak_energy_position(
-                    list(analysis.energy_curve or []), out_fraction
+                    list(analysis.energy_curve or []), played_fraction
                 ),
             })
 
@@ -178,11 +193,12 @@ def _plan_set_inner(queue_uuid: uuid.UUID) -> str | None:
     )
 
     set_context = occasion_context(queue_occasion, queue_vibe_note)
-    if out_fraction < 1.0:
+    if one_chorus:
         set_context["track_length"] = (
-            "SHORT-FORMAT SET: each track is mixed out around its midpoint. "
-            "Plan for quick, decisive handovers with early high-energy "
-            "entries; don't build the arc around a late-song peak."
+            "ONE-CHORUS SET: each track plays through its first chorus and "
+            "is mixed out at its end; the repeated second chorus is skipped. "
+            "Plan for quick, decisive handovers and don't build the arc "
+            "around a second-chorus peak."
         )
     try:
         from app.services.feedback.summary import feedback_context
