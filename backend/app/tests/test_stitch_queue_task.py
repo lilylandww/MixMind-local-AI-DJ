@@ -6,6 +6,7 @@ asserts on QueueRender's terminal state."""
 from __future__ import annotations
 
 import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
@@ -124,8 +125,22 @@ def _storage_writing_stereo_wav(samples_per_pair: int = 44100) -> AsyncMock:
         sf.write(str(dest), np.zeros((samples_per_pair, 2), dtype=np.float32), 44100)
 
     storage.download_file = AsyncMock(side_effect=_download_side)
-    storage.write = AsyncMock(return_value="/abs/out")
+    storage.upload_file = AsyncMock(return_value="/abs/out")
     return storage
+
+
+@pytest.fixture(autouse=True)
+def _no_live_broker():
+    """Keep these tests off the real Redis broker.
+
+    `stitch_queue` dispatches `enforce_cache_budget` fire-and-forget. Against
+    a live broker a running dev worker consumes it, and the evictor then
+    deletes songs/renders underneath this test's fixtures — surfacing as
+    ObjectDeletedError or a TRUNCATE deadlock against the next test.
+    Dispatch behaviour is covered in test_auto_stitch.py, not here.
+    """
+    with patch("app.workers.stitch_queue.celery_app.send_task") as send_task:
+        yield send_task
 
 
 # --- Tests --------------------------------------------------------------
@@ -177,7 +192,7 @@ def test_stitch_queue_atomic_claim_skips_when_already_rendering():
 
     assert res is None
     storage.download_file.assert_not_called()
-    storage.write.assert_not_called()
+    storage.upload_file.assert_not_called()
 
 
 def test_stitch_queue_fails_when_only_one_song():
@@ -222,7 +237,7 @@ def test_stitch_queue_warns_when_no_queue_render_row():
     assert res is None
 
 
-def test_stitch_queue_persists_m4a_key_and_calls_storage_write():
+def test_stitch_queue_persists_m4a_key_and_uploads_from_the_encoded_file():
     queue_id = _seed_locked_queue(n_songs=3)
     storage = _storage_writing_stereo_wav()
     with patch("app.workers.stitch_queue.get_storage", return_value=storage):
@@ -230,10 +245,59 @@ def test_stitch_queue_persists_m4a_key_and_calls_storage_write():
         stitch_queue(queue_id)
 
     expected_key = f"queue_mixes/{queue_id}.m4a"
-    assert storage.write.call_count == 1
-    call = storage.write.call_args
-    assert call.args[0] == expected_key
-    assert len(call.args[1]) > 0  # non-empty bytes
+    assert storage.upload_file.call_count == 1
+    call = storage.upload_file.call_args
+    assert Path(call.args[0]).suffix == ".m4a"  # a path, not a bytes blob
+    assert call.args[1] == expected_key
+
+
+def test_stitch_queue_never_buffers_the_whole_mix_in_memory():
+    """Finding #8: the mix used to be written to a full PCM WAV, encoded,
+    then read back as bytes for the upload — three full-size copies on top
+    of the concatenate spike. It now streams PCM into ffmpeg and uploads
+    from the encoded file's path."""
+    queue_id = _seed_locked_queue(n_songs=3)
+    storage = _storage_writing_stereo_wav()
+    observed = {}
+
+    async def _upload(src, key):
+        path = Path(src)
+        observed["existed"] = path.exists()
+        observed["suffix"] = path.suffix
+        return key
+
+    storage.upload_file = AsyncMock(side_effect=_upload)
+    with patch("app.workers.stitch_queue.get_storage", return_value=storage):
+        from app.workers.stitch_queue import stitch_queue
+        stitch_queue(queue_id)
+
+    # Nothing may materialise the mix as a single bytes object.
+    assert storage.write.call_count == 0
+    assert storage.upload_file.call_count == 1
+    # And the upload happened while the encoded file still existed.
+    assert observed == {"existed": True, "suffix": ".m4a"}
+
+
+def test_iter_pcm_blocks_slices_without_copying_the_whole_array():
+    from app.workers.stitch_queue import _iter_pcm_blocks
+
+    audio = np.arange(10, dtype=np.float32).reshape(5, 2)
+    blocks = list(_iter_pcm_blocks(audio, block_frames=2))
+
+    assert len(blocks) == 3  # 5 frames at 2 per block
+    assert sum(len(b) for b in blocks) == audio.nbytes
+    restored = np.frombuffer(b"".join(blocks), dtype=np.float32).reshape(5, 2)
+    assert np.array_equal(restored, audio)
+
+
+def test_iter_pcm_blocks_promotes_mono_to_one_channel():
+    from app.workers.stitch_queue import _iter_pcm_blocks
+
+    audio = np.zeros(4, dtype=np.float32)
+    blocks = list(_iter_pcm_blocks(audio, block_frames=2))
+
+    assert len(blocks) == 2
+    assert sum(len(b) for b in blocks) == 4 * np.dtype(np.float32).itemsize
 
 
 def test_stitch_queue_handles_tempo_ramp_in_plan_json():
